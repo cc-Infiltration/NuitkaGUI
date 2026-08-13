@@ -34,12 +34,14 @@ Nuitka 的图形化打包工具，使用 **PySide6** 开发，为 Python 程序�
 ## 安装与启动
 
 ```bash
-# 1. 安装依赖
-pip install nuitka PySide6
+# 1. 安装依赖（依赖清单见 requirements.txt）
+pip install -r requirements.txt
 
 # 2. 启动
 python main.py
 ```
+
+> 手动安装等价命令：`pip install nuitka PySide6`
 
 ## 使用说明
 
@@ -73,6 +75,7 @@ NuitkaGUI/
 ├── builder.py    # Nuitka 命令构造与子进程执行
 ├── deps.py       # 环境检查（Nuitka / MSVC / MinGW64 检测与修复建议）
 ├── config.py     # 配置 JSON 持久化
+├── requirements.txt  # 运行依赖清单
 ├── a.ico         # 程序图标
 └── README.md
 ```
