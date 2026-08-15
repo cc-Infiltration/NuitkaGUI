@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 
-from builder import run_process
+from .builder import resolve_python, run_process
 
 CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 _VERSION_RE = re.compile(r"^\d+(\.\d+)+")
@@ -320,6 +320,11 @@ def run_mingw_download(log_queue, stop_event):
                               "winget install Microsoft.VisualStudio.2022.BuildTools"))
         log_queue.put(("mingw_done", -1))
         return
+    python = resolve_python()
+    if not python:
+        log_queue.put(("error", "找不到可用的 Python 解释器(需已安装 Nuitka)。"))
+        log_queue.put(("mingw_done", -1))
+        return
     tmp = tempfile.mkdtemp(prefix="nuitka_mingw_")
     try:
         probe = os.path.join(tmp, "probe.py")
@@ -328,7 +333,7 @@ def run_mingw_download(log_queue, stop_event):
         with open(probe, "w", encoding="utf-8") as f:
             f.write("print('compiler ok')\n")
         cmd = [
-            sys.executable, "-m", "nuitka",
+            python, "-m", "nuitka",
             "--module", "--mingw64", "--nofollow-imports",
             "--assume-yes-for-downloads",
             "--output-dir=%s" % out,

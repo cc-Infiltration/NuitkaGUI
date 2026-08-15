@@ -8,11 +8,82 @@
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 
 _VERSION_RE = re.compile(r"[vV]?\s*(\d+(?:\.\d+)*)")
+
+# 可运行 `python -m nuitka` 的解释器路径(解析后缓存)
+_PYTHON_EXE = None
+
+
+def _is_onefile_temp(path):
+    """Nuitka onefile 解包临时目录特征: 在系统临时目录下且路径含 onefile_"""
+    if not path:
+        return False
+    p = os.path.normcase(os.path.abspath(path))
+    if "onefile_" in p:
+        return True
+    tmp = os.path.normcase(tempfile.gettempdir())
+    return p.startswith(tmp) and "nuitka" in p
+
+
+def _probe_nuitka(python):
+    """探测指定解释器是否安装了 Nuitka"""
+    try:
+        proc = subprocess.run(
+            [python, "-c",
+             "import importlib.metadata as m;print(m.version('nuitka'))"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        return proc.returncode == 0 and bool(proc.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _python_candidates():
+    """按优先级返回候选解释器路径(去重)"""
+    cands = []
+    exe = sys.executable
+    if exe and os.path.isfile(exe) and not _is_onefile_temp(exe):
+        cands.append(exe)
+    for name in ("python", "python3", "py"):
+        p = shutil.which(name)
+        if p and p not in cands:
+            cands.append(p)
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            base = os.path.join(local, "Programs", "Python")
+            try:
+                for d in sorted(os.listdir(base), reverse=True):
+                    p = os.path.join(base, d, "python.exe")
+                    if p not in cands and os.path.isfile(p):
+                        cands.append(p)
+            except OSError:
+                pass
+    return cands
+
+
+def resolve_python():
+    """返回可运行 `python -m nuitka` 的真实解释器路径, 找不到返回 None。
+
+    源码运行: sys.executable 即真实解释器, 直接用。
+    编译产物运行: sys.executable 指向 onefile 解包临时目录(已失效),
+    回退搜索 PATH 与常见安装位置的 Python, 并探测其已安装 Nuitka。
+    结果缓存, 避免每次打包都探测。
+    """
+    global _PYTHON_EXE
+    if _PYTHON_EXE:
+        return _PYTHON_EXE
+    for cand in _python_candidates():
+        if _probe_nuitka(cand):
+            _PYTHON_EXE = cand
+            return cand
+    return None
 
 
 def _sanitize_version(value):
@@ -36,8 +107,11 @@ def _split_extra(text):
 
 
 def build_command(cfg):
-    """根据配置字典构造 Nuitka 命令行参数列表"""
-    cmd = [sys.executable, "-m", "nuitka"]
+    """根据配置字典构造 Nuitka 命令行参数列表; 找不到可用解释器时返回 []"""
+    python = resolve_python()
+    if not python:
+        return []
+    cmd = [python, "-m", "nuitka"]
 
     mode = cfg.get("mode", "onefile")
     if mode == "module":
@@ -59,6 +133,10 @@ def build_command(cfg):
 
     if cfg.get("icon"):
         cmd.append("--windows-icon-from-ico=%s" % cfg["icon"])
+        # 把图标文件一并打进产物, 供运行时加载任务栏图标
+        # (onedir 放到 dist 目录, onefile 放到解包目录, 与 sys.executable 同目录)
+        cmd.append("--include-data-files=%s=%s" % (cfg["icon"],
+                                                   os.path.basename(cfg["icon"])))
 
     for plugin in cfg.get("plugins") or []:
         cmd.append("--enable-plugin=%s" % plugin)
@@ -109,6 +187,13 @@ def build_command(cfg):
 
     script = (cfg.get("script") or "").strip()
     if script:
+        # 目标脚本同目录存在 styles/*.qss 时(工具自身布局), 一并打进产物,
+        # 供运行时加载亮/暗主题样式(放到 dist 的 styles/ 子目录)。
+        style_dir = os.path.join(os.path.dirname(os.path.abspath(script)), "styles")
+        if os.path.isdir(style_dir) and any(
+                f.lower().endswith(".qss") for f in os.listdir(style_dir)):
+            cmd.append("--include-data-files=%s=styles/" %
+                       os.path.join(style_dir, "*.qss"))
         cmd.append(script)
     return cmd
 
@@ -120,6 +205,11 @@ def run_build(log_queue, stop_event, cfg):
     log_queue 消息格式: ("cmd",命令行) / ("line", 文本) / ("error", 文本) / ("done", 退出码)
     """
     cmd = build_command(cfg)
+    if not cmd:
+        log_queue.put(("error", "找不到可用的 Python 解释器(需已安装 Nuitka)。"
+                               "请安装 Python 后执行: pip install nuitka"))
+        log_queue.put(("done", -1))
+        return
     log_queue.put(("cmd", " ".join(cmd)))
     code = run_process(cmd, cwd=os.path.dirname(cfg.get("script") or "") or None,
                        log_queue=log_queue, stop_event=stop_event)

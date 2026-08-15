@@ -3,6 +3,8 @@
 
 import math
 import os
+import re
+import sys
 import threading
 
 from PySide6.QtCore import (
@@ -16,14 +18,43 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHeaderView,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QScrollArea,
+    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
     QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
     QVBoxLayout, QWidget,
 )
 
-import deps
-from builder import build_command, run_build
-from config import DEFAULT_CONFIG, load_config, save_config
+from . import deps
+from .builder import build_command, run_build
+from .config import DEFAULT_CONFIG, load_config, save_config
+
+
+def _load_qss(name):
+    """加载 styles 目录下的主题样式文件(标准 .qss 后缀)。
+
+    源码运行: styles/ 位于项目根目录(app.py 在 modules/ 下)。
+    打包产物: styles/*.qss 由构建命令通过 --include-data-files 打进产物
+    (与 sys.executable 同目录的 styles/ 子目录)。
+    """
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [
+        os.path.join(here, "styles", name),
+        os.path.join(os.getcwd(), "styles", name),
+    ]
+    if sys.executable:
+        candidates.append(
+            os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                         "styles", name))
+    for p in candidates:
+        try:
+            with open(p, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            continue
+    return ""
+
+
+APP_QSS = _load_qss("light.qss")
+APP_DARK_QSS = _load_qss("dark.qss")
 
 # Nuitka 插件名区分大小写
 PLUGIN_OPTIONS = [
@@ -48,19 +79,27 @@ LTO_OPTIONS = (
 LTO_TO_LABEL = dict(LTO_OPTIONS)
 LTO_FROM_LABEL = {label: value for value, label in LTO_OPTIONS}
 
-# Nuitka 输出中的阶段关键字 -> (显示文本, 进度百分比), 按进度从低到高排列
+# Nuitka 输出中的阶段关键字 -> (显示文本, 进度百分比), 按进度从低到高排列。
+# C 编译阶段会叠加真实模块计数(_on_output 中处理), 其余阶段按关键字映射。
 PROGRESS_STEPS = (
-    ("download", "下载编译器/依赖", 5),
-    ("compatibility check", "兼容性检查", 8),
-    ("python level compilation", "Python 编译优化", 40),
-    ("generating source code", "生成 C 源码", 55),
-    ("running data composer", "生成数据", 62),
-    ("starting c compilation", "C 编译 (最耗时)", 72),
+    ("starting python compilation", "启动 Nuitka", 2),
+    ("downloading", "下载编译器/依赖", 5),
+    ("compatibility", "兼容性检查", 8),
+    ("python level compilation", "Python 编译优化", 35),
+    ("generating source code", "生成 C 源码", 50),
+    ("running data composer", "生成数据", 60),
+    ("starting c compilation", "C 编译开始", 72),
     ("completed c compilation", "C 编译完成", 85),
     ("linking", "链接", 90),
     ("creating", "生成产物", 95),
-    ("successfully", "完成", 100),
+    ("successfully created", "完成", 100),
 )
+
+# 用于提取 Nuitka C 编译阶段真实进度的正则(兼容多版本输出格式)
+_C_START_RE = re.compile(r"starting c compilation of (\d+) modules?", re.I)
+_C_TOGO_RE = re.compile(r"(\d+) modules? to go", re.I)
+_C_DONE_RE = re.compile(r"completed c compilation of", re.I)
+_C_BULK_RE = re.compile(r"completed (\d+) c compilation unit", re.I)
 
 # 日志区样式与文字颜色(按主题)
 LOG_STYLES = {
@@ -78,298 +117,15 @@ LOG_COLOR_SETS = {
              "error": "#f26d6d", "normal": "#d4d4d4"},
 }
 
-# 全局清爽浅色主题
-APP_QSS = """
-QMainWindow { background: #f4f6f9; }
-QWidget { font-family: "Microsoft YaHei UI","Segoe UI",sans-serif; font-size: 9.5pt; color: #1f2328; }
-QGroupBox {
-    background: #ffffff;
-    border: 1px solid #e3e8ef;
-    border-radius: 8px;
-    margin-top: 14px;
-    padding: 10px 6px 6px 6px;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 14px;
-    top: 4px;
-    padding: 0 4px;
-    color: #2f3b4d;
-    font-weight: bold;
-}
-QLabel { color: #3d4a5c; }
-QLineEdit, QComboBox, QSpinBox {
-    background: #ffffff;
-    border: 1px solid #d5dce5;
-    border-radius: 5px;
-    padding: 4px 8px;
-    min-height: 18px;
-    selection-background-color: #2d8cf0;
-    selection-color: #ffffff;
-}
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #2d8cf0; }
-QComboBox::drop-down { border: none; width: 22px; }
-QComboBox QAbstractItemView {
-    background: #ffffff;
-    border: 1px solid #d5dce5;
-    selection-background-color: #e8f1fd;
-    selection-color: #2d8cf0;
-    outline: 0;
-}
-QPushButton {
-    background: #ffffff;
-    border: 1px solid #d5dce5;
-    border-radius: 5px;
-    padding: 5px 14px;
-    color: #2f3b4d;
-}
-QPushButton:hover { background: #f0f4fa; border-color: #b8c6d9; }
-QPushButton:pressed { background: #e3ecf7; }
-QPushButton:disabled { color: #b0b8c4; background: #f2f4f7; border-color: #e8ecf2; }
-QPushButton#primaryBtn {
-    background: #2d8cf0;
-    border: none;
-    color: #ffffff;
-    padding: 7px 24px;
-    font-weight: bold;
-}
-QPushButton#primaryBtn:hover { background: #237fe0; }
-QPushButton#primaryBtn:pressed { background: #1b6fc9; }
-QPushButton#primaryBtn:disabled { background: #a8c8ee; color: #eaf2fc; }
-QTabWidget::pane {
-    border: 1px solid #e3e8ef;
-    border-radius: 8px;
-    background: #ffffff;
-    top: -1px;
-}
-QTabBar::tab {
-    background: #eef1f5;
-    border: 1px solid #e3e8ef;
-    border-bottom: none;
-    padding: 6px 18px;
-    margin-right: 2px;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-    color: #5a6a7e;
-}
-QTabBar::tab:selected {
-    background: #ffffff;
-    color: #2d8cf0;
-    font-weight: bold;
-}
-QTabBar::tab:hover:!selected { background: #f5f8fc; }
-QCheckBox, QRadioButton { color: #3d4a5c; spacing: 6px; }
-QProgressBar {
-    border: 1px solid #d5dce5;
-    border-radius: 6px;
-    background: #eef1f5;
-    text-align: center;
-    color: #2f3b4d;
-}
-QProgressBar::chunk { background: #2d8cf0; border-radius: 6px; }
-QListWidget {
-    background: #ffffff;
-    border: 1px solid #d5dce5;
-    border-radius: 5px;
-    outline: 0;
-}
-QListWidget::item { padding: 2px 4px; }
-QListWidget::item:selected { background: #e8f1fd; color: #2d8cf0; }
-QTableWidget {
-    background: #ffffff;
-    border: 1px solid #d5dce5;
-    border-radius: 5px;
-    gridline-color: #eef1f5;
-    color: #1f2328;
-    outline: 0;
-}
-QTableWidget::item { padding: 3px 6px; }
-QTableWidget::item:selected { background: #e8f1fd; color: #2d8cf0; }
-QHeaderView::section {
-    background: #f0f3f7;
-    border: none;
-    border-bottom: 1px solid #d5dce5;
-    padding: 4px 8px;
-    color: #5a6a7e;
-    font-weight: bold;
-}
-QMenuBar { background: transparent; }
-QMenuBar::item { padding: 5px 10px; background: transparent; }
-QMenuBar::item:selected { background: #e8f1fd; border-radius: 5px; }
-QMenu { background: #ffffff; border: 1px solid #e3e8ef; }
-QMenu::item { padding: 5px 22px; }
-QMenu::item:selected { background: #e8f1fd; color: #2d8cf0; }
-QMessageBox {
-    background: #ffffff;
-}
-QMessageBox QLabel {
-    color: #1f2328;
-    background: transparent;
-}
-QScrollBar:vertical {
-    background: transparent; width: 10px; margin: 2px;
-    border-radius: 5px;
-}
-QScrollBar::handle:vertical {
-    background: #c3ccd8; border-radius: 5px; min-height: 24px;
-}
-QScrollBar::handle:vertical:hover { background: #a8b4c4; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar:horizontal {
-    background: transparent; height: 10px; margin: 2px;
-    border-radius: 5px;
-}
-QScrollBar::handle:horizontal {
-    background: #c3ccd8; border-radius: 5px; min-width: 24px;
-}
-QScrollBar::handle:horizontal:hover { background: #a8b4c4; }
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-"""
+# 选项卡定义: (页签标题, 构建方法名)。除首个外均懒加载(切换时构建)
+TAB_SPECS = (
+    ("基本选项", "_build_basic_tab"),
+    ("插件", "_build_plugin_tab"),
+    ("数据与模块", "_build_data_tab"),
+    ("Windows 信息", "_build_win_tab"),
+    ("高级", "_build_advanced_tab"),
+)
 
-# 全局暗色主题
-APP_DARK_QSS = """
-QMainWindow { background: #1e1f22; }
-QWidget { font-family: "Microsoft YaHei UI","Segoe UI",sans-serif; font-size: 9.5pt; color: #e6e6e6; }
-QGroupBox {
-    background: #2b2d31;
-    border: 1px solid #3f4248;
-    border-radius: 8px;
-    margin-top: 14px;
-    padding: 10px 6px 6px 6px;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 14px;
-    top: 4px;
-    padding: 0 4px;
-    color: #f2f3f5;
-    font-weight: bold;
-}
-QLabel { color: #d0d4da; }
-QLineEdit, QComboBox, QSpinBox {
-    background: #2f3136;
-    border: 1px solid #4a4d55;
-    border-radius: 5px;
-    padding: 4px 8px;
-    min-height: 18px;
-    color: #e6e6e6;
-    selection-background-color: #2d8cf0;
-    selection-color: #ffffff;
-}
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #4d9fff; }
-QComboBox::drop-down { border: none; width: 22px; }
-QComboBox QAbstractItemView {
-    background: #2b2d31;
-    border: 1px solid #4a4d55;
-    selection-background-color: #2d4d78;
-    selection-color: #ffffff;
-    outline: 0;
-}
-QPushButton {
-    background: #3a3d43;
-    border: 1px solid #4a4d55;
-    border-radius: 5px;
-    padding: 5px 14px;
-    color: #e6e6e6;
-}
-QPushButton:hover { background: #44474e; border-color: #5a5e66; }
-QPushButton:pressed { background: #50545c; }
-QPushButton:disabled { color: #6f737b; background: #313338; border-color: #3a3d43; }
-QPushButton#primaryBtn {
-    background: #2d8cf0;
-    border: none;
-    color: #ffffff;
-    padding: 7px 24px;
-    font-weight: bold;
-}
-QPushButton#primaryBtn:hover { background: #4d9fff; }
-QPushButton#primaryBtn:pressed { background: #1b6fc9; }
-QPushButton#primaryBtn:disabled { background: #2b4a6e; color: #9db4cc; }
-QTabWidget::pane {
-    border: 1px solid #3f4248;
-    border-radius: 8px;
-    background: #2b2d31;
-    top: -1px;
-}
-QTabBar::tab {
-    background: #26272b;
-    border: 1px solid #3f4248;
-    border-bottom: none;
-    padding: 6px 18px;
-    margin-right: 2px;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-    color: #a8adb5;
-}
-QTabBar::tab:selected {
-    background: #2b2d31;
-    color: #4d9fff;
-    font-weight: bold;
-}
-QTabBar::tab:hover:!selected { background: #303238; }
-QCheckBox, QRadioButton { color: #d0d4da; spacing: 6px; }
-QProgressBar {
-    border: 1px solid #4a4d55;
-    border-radius: 6px;
-    background: #313338;
-    text-align: center;
-    color: #e6e6e6;
-}
-QProgressBar::chunk { background: #2d8cf0; border-radius: 6px; }
-QListWidget {
-    background: #2f3136;
-    color: #e6e6e6;
-    border: 1px solid #4a4d55;
-    border-radius: 5px;
-    outline: 0;
-}
-QListWidget::item { padding: 2px 4px; }
-QListWidget::item:selected { background: #2d4d78; color: #ffffff; }
-QTableWidget {
-    background: #2f3136;
-    border: 1px solid #4a4d55;
-    border-radius: 5px;
-    gridline-color: #3f4248;
-    color: #e6e6e6;
-    outline: 0;
-}
-QTableWidget::item { padding: 3px 6px; }
-QTableWidget::item:selected { background: #2d4d78; color: #ffffff; }
-QHeaderView::section {
-    background: #26272b;
-    border: none;
-    border-bottom: 1px solid #4a4d55;
-    padding: 4px 8px;
-    color: #a8adb5;
-    font-weight: bold;
-}
-QMenuBar { background: transparent; }
-QMenuBar::item { padding: 5px 10px; background: transparent; color: #d0d4da; }
-QMenuBar::item:selected { background: #3a3d43; border-radius: 5px; }
-QMenu { background: #2b2d31; border: 1px solid #3f4248; color: #e6e6e6; }
-QMenu::item { padding: 5px 22px; }
-QMenu::item:selected { background: #2d4d78; color: #ffffff; }
-QMessageBox { background: #2b2d31; }
-QMessageBox QLabel { color: #e6e6e6; background: transparent; }
-QScrollBar:vertical {
-    background: transparent; width: 10px; margin: 2px;
-    border-radius: 5px;
-}
-QScrollBar::handle:vertical {
-    background: #4a4d55; border-radius: 5px; min-height: 24px;
-}
-QScrollBar::handle:vertical:hover { background: #5a5e66; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar:horizontal {
-    background: transparent; height: 10px; margin: 2px;
-    border-radius: 5px;
-}
-QScrollBar::handle:horizontal {
-    background: #4a4d55; border-radius: 5px; min-width: 24px;
-}
-QScrollBar::handle:horizontal:hover { background: #5a5e66; }
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-"""
 
 
 class WorkerQueue:
@@ -761,13 +517,26 @@ class NuitkaGUI(QMainWindow):
         self.env_compiler_ok = False
         self.theme = "light"
         self.log_colors = LOG_COLOR_SETS["light"]
+        self._built_tabs = set()
+        self._pending_cfg = None
+        # C 编译真实进度计数
+        self._c_total = 0
+        self._c_done = 0
+
+        cfg = load_config()
+        self.theme = cfg.get("theme", "light")
+        # 提速关键: 在创建任何子控件之前先在应用级应用完整样式, 让每个控件在
+        # 创建时就完成样式解析; 若窗口构建完成后再从"无样式"一次性应用完整 QSS,
+        # Qt 会对整棵控件树重新抛光(实测 ~1.3s)。运行时主题切换仍走窗口级, 仅 ~0.01s。
+        QApplication.instance().setStyleSheet(
+            APP_QSS if self.theme == "light" else APP_DARK_QSS)
 
         self._build_ui()
         self._build_menu()
-        self._load_from_config(load_config())
-        self._apply_theme(self.theme)
+        self._load_from_config(cfg)
+        self._apply_theme_parts()  # 窗口级样式未设置, 只补局部部件样式
         # 启动后自动做一次环境检查(后台线程, 不阻塞界面)
-        QTimer.singleShot(400, self._start_env_check)
+        QTimer.singleShot(100, self._start_env_check)
 
     # ---------- 界面 ----------
     def _build_ui(self):
@@ -820,13 +589,12 @@ class NuitkaGUI(QMainWindow):
         grid.setColumnStretch(1, 1)
         root.addWidget(top)
 
-        # 选项卡
+        # 选项卡(懒加载: 仅首屏构建"基本选项", 其余切换时构建)
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_basic_tab(), "基本选项")
-        self.tabs.addTab(self._build_plugin_tab(), "插件")
-        self.tabs.addTab(self._build_data_tab(), "数据与模块")
-        self.tabs.addTab(self._build_win_tab(), "Windows 信息")
-        self.tabs.addTab(self._build_advanced_tab(), "高级")
+        for label, _fn in TAB_SPECS:
+            self.tabs.addTab(QWidget(), label)
+        self.tabs.currentChanged.connect(self._ensure_tab)
+        self._ensure_tab(0)
         root.addWidget(self.tabs, 2)
 
         # 日志区(可折叠, 保留标题与无文字箭头按钮)
@@ -862,7 +630,6 @@ class NuitkaGUI(QMainWindow):
         bottom.setSpacing(10)
         self.progress = ThreeBodyIndicator()
         self.lbl_status = QLabel("就绪")
-        self.lbl_status.setStyleSheet("color:#5a6a7e;")
         self.btn_start = QPushButton("开始打包")
         self.btn_start.setObjectName("primaryBtn")
         self.btn_cancel = QPushButton("取消")
@@ -885,12 +652,57 @@ class NuitkaGUI(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet(
-            "QScrollArea{background:transparent;border:none;}"
-            "QScrollArea>QWidget>QWidget{background:transparent;}")
         content = QWidget()
         scroll.setWidget(content)
         return scroll, content
+
+    # ---------- 选项卡懒加载 ----------
+    def _ensure_tab(self, idx):
+        """首次切换到某页签时才构建其内容, 降低启动开销。"""
+        if idx in self._built_tabs:
+            return
+        self._built_tabs.add(idx)
+        label, fn_name = TAB_SPECS[idx]
+        widget = getattr(self, fn_name)()
+        self.tabs.removeTab(idx)
+        self.tabs.insertTab(idx, widget, label)
+        self.tabs.setCurrentIndex(idx)
+        if self._pending_cfg is not None:
+            self._apply_tab_cfg(idx, self._pending_cfg)
+
+    def _ensure_all_tabs(self):
+        """确保全部页签已构建(读取/保存完整配置前调用)。"""
+        for i in range(len(TAB_SPECS)):
+            self._ensure_tab(i)
+
+    def _apply_tab_cfg(self, idx, cfg):
+        """把配置恢复到指定页签的控件(懒加载页签首次构建后调用)。"""
+        if idx == 0:  # 基本选项
+            self.cb_lto.setCurrentText(LTO_TO_LABEL.get(cfg.get("lto", "auto"),
+                                                        LTO_TO_LABEL["auto"]))
+            self.spin_jobs.setValue(int(cfg.get("jobs") or 4))
+            self.chk_remove.setChecked(bool(cfg.get("remove_output", False)))
+        elif idx == 1:  # 插件
+            saved = {p.lower() for p in cfg.get("plugins", [])}
+            for name, cb in self.plugin_checks.items():
+                cb.setChecked(name in saved)
+        elif idx == 2:  # 数据与模块
+            self.ed_data_dirs.set_items(cfg.get("data_dirs", []))
+            self.ed_data_files.set_items(cfg.get("data_files", []))
+            self.ed_modules.set_data({
+                "include_packages": cfg.get("include_packages", []),
+                "include_modules": cfg.get("include_modules", []),
+                "exclude_modules": cfg.get("exclude_modules", []),
+            })
+        elif idx == 3:  # Windows 信息
+            self.ed_company.setText(cfg.get("company_name", ""))
+            self.ed_product.setText(cfg.get("product_name", ""))
+            self.ed_file_version.setText(cfg.get("file_version", ""))
+            self.ed_product_version.setText(cfg.get("product_version", ""))
+            self.ed_description.setText(cfg.get("file_description", ""))
+            self.ed_copyright.setText(cfg.get("copyright", ""))
+        elif idx == 4:  # 高级
+            self.ed_extra.setText(cfg.get("extra_args", ""))
 
     def _build_plugin_tab(self):
         scroll, content = self._scrollable()
@@ -915,7 +727,7 @@ class NuitkaGUI(QMainWindow):
 
     def _update_upx_marker(self):
         """UPX 被勾选但系统未安装时, 将选项标记为淡红色(柔和, 不刺眼)。"""
-        cb = self.plugin_checks.get("upx")
+        cb = self.plugin_checks.get("upx") if hasattr(self, "plugin_checks") else None
         if cb is None:
             return
         if cb.isChecked() and not deps.check_upx():
@@ -958,7 +770,7 @@ class NuitkaGUI(QMainWindow):
         self.chk_remove = QCheckBox("清理旧构建缓存")
         opt_form.addWidget(self.chk_remove, 1, 0, 1, 2)
         hint = QLabel("自动确认依赖下载已启用 (--assume-yes-for-downloads)")
-        hint.setStyleSheet("color:#8a95a5;")
+        hint.setProperty("hint", True)
         opt_form.addWidget(hint, 1, 2, 1, 2)
         layout.addWidget(opt_group)
         layout.addStretch()
@@ -1006,7 +818,7 @@ class NuitkaGUI(QMainWindow):
         form.addRow("版权信息:", self.ed_copyright)
         hint = QLabel("提示: 这些信息会写入打包产物的 Windows 文件属性中。"
                       "版本号仅支持数字与点, 如 1.0.0。")
-        hint.setStyleSheet("color:#8a95a5;")
+        hint.setProperty("hint", True)
         form.addRow(hint)
         return scroll
 
@@ -1019,7 +831,7 @@ class NuitkaGUI(QMainWindow):
         self.ed_extra = QLineEdit()
         layout.addWidget(self.ed_extra)
         hint = QLabel("示例: --python-flag=no_site  --windows-uac-admin  --nofollow-import-to=tkinter")
-        hint.setStyleSheet("color:#8a95a5;")
+        hint.setProperty("hint", True)
         layout.addWidget(hint)
         layout.addStretch()
         return scroll
@@ -1067,6 +879,7 @@ class NuitkaGUI(QMainWindow):
 
     # ---------- 配置 <-> 界面 ----------
     def _collect_config(self):
+        self._ensure_all_tabs()  # 读取完整配置前确保所有页签已构建
         cfg = dict(DEFAULT_CONFIG)
         cfg.update({
             "script": self.ed_script.text().strip(),
@@ -1094,6 +907,8 @@ class NuitkaGUI(QMainWindow):
         return cfg
 
     def _load_from_config(self, cfg):
+        self._pending_cfg = cfg
+        # 公共控件(非页签)
         self.ed_script.setText(cfg.get("script", ""))
         self.ed_output_dir.setText(cfg.get("output_dir", ""))
         self.ed_output_name.setText(cfg.get("output_filename", ""))
@@ -1102,28 +917,11 @@ class NuitkaGUI(QMainWindow):
         self.rb_console_yes.setChecked(bool(cfg.get("console", True)))
         self.rb_console_no.setChecked(not bool(cfg.get("console", True)))
         self.ed_icon.setText(cfg.get("icon", ""))
-        saved_plugins = {p.lower() for p in cfg.get("plugins", [])}
-        for name, cb in self.plugin_checks.items():
-            cb.setChecked(name in saved_plugins)
-        self.cb_lto.setCurrentText(LTO_TO_LABEL.get(cfg.get("lto", "auto"),
-                                                    LTO_TO_LABEL["auto"]))
-        self.spin_jobs.setValue(int(cfg.get("jobs") or 4))
-        self.chk_remove.setChecked(bool(cfg.get("remove_output", False)))
-        self.ed_data_dirs.set_items(cfg.get("data_dirs", []))
-        self.ed_data_files.set_items(cfg.get("data_files", []))
-        self.ed_modules.set_data({
-            "include_packages": cfg.get("include_packages", []),
-            "include_modules": cfg.get("include_modules", []),
-            "exclude_modules": cfg.get("exclude_modules", []),
-        })
-        self.ed_company.setText(cfg.get("company_name", ""))
-        self.ed_product.setText(cfg.get("product_name", ""))
-        self.ed_file_version.setText(cfg.get("file_version", ""))
-        self.ed_product_version.setText(cfg.get("product_version", ""))
-        self.ed_description.setText(cfg.get("file_description", ""))
-        self.ed_copyright.setText(cfg.get("copyright", ""))
-        self.ed_extra.setText(cfg.get("extra_args", ""))
         self.theme = cfg.get("theme", "light")
+        # 已构建页签的控件
+        for i in range(len(TAB_SPECS)):
+            if i in self._built_tabs:
+                self._apply_tab_cfg(i, cfg)
 
     # ---------- 配置持久化 ----------
     def _save_config_now(self):
@@ -1138,9 +936,14 @@ class NuitkaGUI(QMainWindow):
 
     # ---------- 主题 ----------
     def _apply_theme(self, theme):
-        """切换亮色/暗色主题, 并同步日志区样式与菜单选中态。"""
+        """切换亮色/暗色主题(运行时调用): 重新应用窗口级样式并同步部件。"""
         self.theme = theme
         self.setStyleSheet(APP_QSS if theme == "light" else APP_DARK_QSS)
+        self._apply_theme_parts()
+
+    def _apply_theme_parts(self):
+        """应用除窗口级样式外的主题相关部件样式(启动时避免重复抛光)。"""
+        theme = self.theme
         self.log_text.setStyleSheet(LOG_STYLES[theme])
         self.log_colors = LOG_COLOR_SETS[theme]
         self.log_box.set_theme(collapsible_qss(theme))
@@ -1150,7 +953,7 @@ class NuitkaGUI(QMainWindow):
 
     def _status_default_color(self):
         """状态栏文字默认颜色(按主题)。"""
-        return "#a8adb5" if self.theme == "dark" else "#5a6a7e"
+        return "#a8adb5" if self.theme == "dark" else "#3f4f63"
 
     def _set_status_color(self, color):
         """设置状态栏文字颜色; color 为 None 时恢复主题默认色。"""
@@ -1175,6 +978,7 @@ class NuitkaGUI(QMainWindow):
     def _preview_command(self):
         cmd = build_command(self._collect_config())
         if not cmd:
+            self._log("找不到可用的 Python 解释器(需已安装 Nuitka)", "error")
             return
         self._log("========== 命令预览 ==========", "cmd")
         self._log(" ".join(cmd), "cmd")
@@ -1260,6 +1064,8 @@ class NuitkaGUI(QMainWindow):
         save_config(cfg)
         self.stop_event.clear()
         self._current_task = "build"
+        self._c_total = 0
+        self._c_done = 0
         self._log("========== 开始打包 ==========", "cmd")
         self._start_worker(run_build, cfg)
 
@@ -1291,9 +1097,39 @@ class NuitkaGUI(QMainWindow):
     def _on_output(self, line):
         self._log(line)
         low = line.lower()
+
+        # --- C 编译真实进度: 从 Nuitka 输出统计模块总数与已完成数 ---
+        m = _C_START_RE.search(low)
+        if m:
+            self._c_total = int(m.group(1))
+            self._c_done = 0
+        m = _C_DONE_RE.search(low)
+        if m:
+            self._c_done += 1
+        m = _C_TOGO_RE.search(low)
+        if m and self._c_total:
+            self._c_done = max(self._c_done, self._c_total - int(m.group(1)))
+        m = _C_BULK_RE.search(low)
+        if m:
+            self._c_done += int(m.group(1))
+
+        if self._c_total:
+            done = min(self._c_done, self._c_total)
+            if 0 < done < self._c_total:
+                pct = 72 + round(done / self._c_total * 13)
+                self.lbl_status.setText(
+                    "C 编译中: %d/%d (%d%%)" % (done, self._c_total, pct))
+                return
+            if done >= self._c_total:
+                # 本行标记编译完成; 清零总数, 让后续"链接/生成/完成"行走关键字映射
+                self.lbl_status.setText("C 编译完成 (85%%)")
+                self._c_total = 0
+                return
+
+        # --- 阶段关键字映射 ---
         for _kw, _label, pct in PROGRESS_STEPS:
             if _kw in low:
-                self.lbl_status.setText("处理进度: %d%%" % pct)
+                self.lbl_status.setText("%s (%d%%)" % (_label, pct))
                 break
 
     def _on_task_done(self, code):

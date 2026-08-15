@@ -1,7 +1,18 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+.main.dist/
 *.py[codz]
 *$py.class
+
+# Nuitka 打包产物 / Inno Setup 安装程序
+main.dist/
+main.build/
+.nuitka_cache/
+_inno_install/
+_inno/
+is_setup.exe
+NuitkaGUI-Setup-*.exe
+*.iss~
 
 # C extensions
 *.so
