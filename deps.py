@@ -59,8 +59,20 @@ def _parse_version(text):
 
 
 def check_python():
-    """返回 Python 版本字符串"""
+    """返回 Python 版本字符串。"""
     return sys.version.split()[0]
+
+
+def check_upx():
+    """检测 UPX 是否可用 (PATH 或常见安装位置)。"""
+    if shutil.which("upx"):
+        return True
+    for cand in (r"C:\upx\upx.exe",
+                 r"C:\Program Files\upx\upx.exe",
+                 r"C:\Program Files (x86)\upx\upx.exe"):
+        if os.path.isfile(cand):
+            return True
+    return False
 
 
 def python_requires_msvc():

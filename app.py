@@ -1,19 +1,23 @@
 # -*- coding: utf-8 -*-
 #Nuitka 打包工具 GUI 主界面 (PySide6)
 
+import math
 import os
 import threading
 
-from PySide6.QtCore import QObject, QRegularExpression, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QElapsedTimer, QObject, QPointF, QRegularExpression, Qt, QTimer, Signal,
+)
 from PySide6.QtGui import (
-    QAction, QActionGroup, QColor, QFont, QRegularExpressionValidator,
-    QTextCharFormat, QTextCursor,
+    QAction, QActionGroup, QColor, QFont, QPainter, QPolygonF,
+    QRegularExpressionValidator, QTextCharFormat, QTextCursor,
 )
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout,
-    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QRadioButton, QScrollArea, QSpinBox, QTabWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
+    QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHeaderView,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QScrollArea,
+    QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
     QVBoxLayout, QWidget,
 )
 
@@ -171,6 +175,24 @@ QListWidget {
 }
 QListWidget::item { padding: 2px 4px; }
 QListWidget::item:selected { background: #e8f1fd; color: #2d8cf0; }
+QTableWidget {
+    background: #ffffff;
+    border: 1px solid #d5dce5;
+    border-radius: 5px;
+    gridline-color: #eef1f5;
+    color: #1f2328;
+    outline: 0;
+}
+QTableWidget::item { padding: 3px 6px; }
+QTableWidget::item:selected { background: #e8f1fd; color: #2d8cf0; }
+QHeaderView::section {
+    background: #f0f3f7;
+    border: none;
+    border-bottom: 1px solid #d5dce5;
+    padding: 4px 8px;
+    color: #5a6a7e;
+    font-weight: bold;
+}
 QMenuBar { background: transparent; }
 QMenuBar::item { padding: 5px 10px; background: transparent; }
 QMenuBar::item:selected { background: #e8f1fd; border-radius: 5px; }
@@ -303,6 +325,24 @@ QListWidget {
 }
 QListWidget::item { padding: 2px 4px; }
 QListWidget::item:selected { background: #2d4d78; color: #ffffff; }
+QTableWidget {
+    background: #2f3136;
+    border: 1px solid #4a4d55;
+    border-radius: 5px;
+    gridline-color: #3f4248;
+    color: #e6e6e6;
+    outline: 0;
+}
+QTableWidget::item { padding: 3px 6px; }
+QTableWidget::item:selected { background: #2d4d78; color: #ffffff; }
+QHeaderView::section {
+    background: #26272b;
+    border: none;
+    border-bottom: 1px solid #4a4d55;
+    padding: 4px 8px;
+    color: #a8adb5;
+    font-weight: bold;
+}
 QMenuBar { background: transparent; }
 QMenuBar::item { padding: 5px 10px; background: transparent; color: #d0d4da; }
 QMenuBar::item:selected { background: #3a3d43; border-radius: 5px; }
@@ -384,77 +424,333 @@ class EnvWorker(QObject):
         self.finished.emit(deps.run_env_check())
 
 
-class ListEditor(QGroupBox):
-    """带添加/删除的列表编辑器, 支持单个输入框或"来源=目标"双输入框。"""
+class ThreeBodyIndicator(QWidget):
+    """不确定进度指示器
 
-    def __init__(self, title, second_label=None, parent=None):
-        super().__init__(title, parent)
-        self._items = []
-        layout = QVBoxLayout(self)
-        layout.setSpacing(4)
+    三个圆点构成三角形, 整体匀速自转; 每个圆点沿径向摆动并伴随
+    缩放与透明度变化, 视觉上"三点追赶旋转", 表示任务进行中。
+    """
 
-        row = QHBoxLayout()
-        self._entry = QLineEdit()
-        row.addWidget(self._entry, 1)
-        if second_label:
-            self._entry2 = QLineEdit()
-            self._entry2.setPlaceholderText(second_label)
-            row.addWidget(self._entry2, 1)
+    def __init__(self, parent=None, size=36, speed=0.8, color="#C19A6B", alpha=0.7):
+        super().__init__(parent)
+        self._size = size
+        self._speed = speed
+        self._color = QColor(color)
+        self._alpha = alpha
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._elapsed = QElapsedTimer()
+        self._elapsed.start()
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)  # ~60 FPS
+        self._timer.timeout.connect(self.update)
+        self._running = False
+
+    def setRunning(self, running):
+        self._running = bool(running)
+        if self._running:
+            self._elapsed.restart()
+            self._timer.start()
         else:
-            self._entry2 = None
-        layout.addLayout(row)
+            self._timer.stop()
+        self.update()
 
-        self._list = QListWidget()
-        self._list.setMaximumHeight(90)
-        layout.addWidget(self._list)
+    def isRunning(self):
+        return self._running
 
-        btns = QHBoxLayout()
-        add_btn = QPushButton("添加")
-        rm_btn = QPushButton("删除选中")
+    def paintEvent(self, _event):
+        if not self._running:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        t = self._elapsed.elapsed() / 1000.0
+        center = QPointF(self._size / 2.0, self._size / 2.0)
+        radius = self._size * 0.19          # 三角形外接圆半径(收缩防溢出)
+        dot_d = self._size * 0.28           # 圆点直径
+        spin = (t / (self._speed * 2.5)) * 360.0   # 整体自转
+        base_angles = (90.0, 210.0, 330.0)  # 顶 / 左下 / 右下
+        phases = (-0.3, -0.15, 0.0)         # 摆动相位(错开)
+        two_pi = 2.0 * math.pi
+        for idx, (ang, ph) in enumerate(zip(base_angles, phases)):
+            m = math.sin(two_pi * (t / self._speed) + two_pi * ph)
+            if idx == 2:                    # 第三个圆点反向摆动
+                m = -m
+            scale = 1.0 - 0.35 * abs(m)     # 0.65 ~ 1.0
+            alpha = 1.0 - 0.20 * abs(m)     # 0.8 ~ 1.0
+            rad = radius * (1.0 + 0.66 * m)  # 径向摆动 ±66%
+            a = math.radians(spin + ang)
+            x = center.x() + rad * math.cos(a)
+            y = center.y() - rad * math.sin(a)
+            color = QColor(self._color)
+            color.setAlphaF(self._alpha * alpha)  # 全局 0.7 透明度 × 摆动透明度
+            p.setBrush(color)
+            p.drawEllipse(QPointF(x, y), dot_d * scale / 2.0, dot_d * scale / 2.0)
+        p.end()
+
+
+class ArrowButton(QToolButton):
+    """无文字的箭头按钮: 展开时朝下(▼), 折叠时朝右(▶)。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._expanded = True
+        self.setFixedSize(18, 18)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAutoRaise(True)
+        self.setToolTip("展开 / 折叠")
+
+    def setExpanded(self, expanded):
+        self._expanded = bool(expanded)
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#8a95a5"))
+        if self._expanded:
+            pts = [QPointF(4, 6), QPointF(14, 6), QPointF(9, 12)]
+        else:
+            pts = [QPointF(6, 4), QPointF(6, 14), QPointF(12, 9)]
+        p.drawPolygon(QPolygonF(pts))
+        p.end()
+
+
+class CollapsibleBox(QWidget):
+    """可折叠分组: 标题行(箭头按钮 + 标题) + 内容区, 点击箭头切换展开/折叠。"""
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(0)
+
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(8, 5, 8, 5)
+        hl.setSpacing(6)
+        self._btn = ArrowButton()
+        self._btn.clicked.connect(self._toggle)
+        hl.addWidget(self._btn)
+        title_lbl = QLabel(title)
+        font = title_lbl.font()
+        font.setBold(True)
+        title_lbl.setFont(font)
+        hl.addWidget(title_lbl)
+        hl.addStretch()
+        self._layout.addWidget(header)
+
+        self._content = QWidget()
+        self._layout.addWidget(self._content)
+
+    def content(self):
+        """返回内容容器, 外部把内容放进去。"""
+        return self._content
+
+    def isExpanded(self):
+        return self._content.isVisible()
+
+    def _toggle(self):
+        expanded = not self.isExpanded()
+        self._content.setVisible(expanded)
+        self._btn.setExpanded(expanded)
+
+    def set_theme(self, qss):
+        self.setStyleSheet(qss)
+
+
+def collapsible_qss(theme):
+    """可折叠分组的卡片样式(按主题)。"""
+    if theme == "dark":
+        return (".CollapsibleBox{background:#2b2d31;"
+                "border:1px solid #3f4248;border-radius:8px;}")
+    return (".CollapsibleBox{background:#ffffff;"
+            "border:1px solid #e3e8ef;border-radius:8px;}")
+
+
+class RowTableEditor(QGroupBox):
+    """数据资源编辑器: 两列"本地 → 程序内"表格, 表头自解释, 无需说明文字。
+
+    列表以表格呈现(表头: 本地路径 | 程序内路径), 每个字段对应打包后的
+    存放位置, 比"来源=目标"自由文本直观得多。
+    """
+
+    def __init__(self, title, parent=None):
+        super().__init__(title, parent)
+        self._items = []  # [(src, dest), ...]
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        entry_row = QHBoxLayout()
+        entry_row.setSpacing(6)
+        entry_row.addWidget(QLabel("本地"))
+        self.ed_src = QLineEdit()
+        entry_row.addWidget(self.ed_src, 1)
+        entry_row.addWidget(QLabel("→"))
+        entry_row.addWidget(QLabel("程序内"))
+        self.ed_dest = QLineEdit()
+        entry_row.addWidget(self.ed_dest, 1)
+        add_btn = QPushButton("+ 添加")
         add_btn.clicked.connect(self._add)
+        entry_row.addWidget(add_btn)
+        layout.addLayout(entry_row)
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["本地路径", "程序内路径"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setMinimumHeight(96)
+        layout.addWidget(self.table)
+
+        rm_btn = QPushButton("删除选中")
         rm_btn.clicked.connect(self._remove)
-        btns.addWidget(add_btn)
-        btns.addWidget(rm_btn)
-        btns.addStretch()
-        layout.addLayout(btns)
+        layout.addWidget(rm_btn)
 
     def _add(self):
-        a = self._entry.text().strip()
-        if not a:
+        src = self.ed_src.text().strip()
+        if not src:
             return
-        if self._entry2 is not None:
-            b = self._entry2.text().strip()
-            item = "%s=%s" % (a, b) if b else a
-        else:
-            item = a
-        self._items.append(item)
-        self._list.addItem(item)
-        self._entry.clear()
-        if self._entry2 is not None:
-            self._entry2.clear()
+        dest = self.ed_dest.text().strip()
+        self._items.append((src, dest))
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(src))
+        self.table.setItem(row, 1, QTableWidgetItem(dest))
+        self.ed_src.clear()
+        self.ed_dest.clear()
 
     def _remove(self):
-        for row in reversed(self._list.selectedIndexes()):
-            idx = row.row()
-            self._list.takeItem(idx)
-            del self._items[idx]
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        self.table.removeRow(row)
+        del self._items[row]
 
     def set_items(self, items):
-        self._list.clear()
-        self._items = list(items)
-        for item in self._items:
-            self._list.addItem(item)
+        """items: ["src=dest", "src", ...] 或 [(src, dest), ...]"""
+        self.table.setRowCount(0)
+        self._items = []
+        for it in items:
+            if isinstance(it, tuple):
+                src, dest = it
+            elif "=" in it:
+                src, dest = it.split("=", 1)
+            else:
+                src, dest = it, ""
+            self._items.append((src, dest))
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(src))
+            self.table.setItem(row, 1, QTableWidgetItem(dest))
 
     def get_items(self):
-        return list(self._items)
+        return ["%s=%s" % (s, d) if d else s for s, d in self._items]
+
+
+class ModuleListEditor(QGroupBox):
+    """模块与导入控制: 单选切换类型, 各自独立列表, 按钮文本显示数量。"""
+
+    TYPES = (("include_packages", "包含包"),
+             ("include_modules", "包含模块"),
+             ("exclude_modules", "排除导入"))
+
+    def __init__(self, parent=None):
+        super().__init__("模块与导入", parent)
+        self._data = {key: [] for key, _ in self.TYPES}
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        radio_row = QHBoxLayout()
+        radio_row.setSpacing(14)
+        self.radio = {}
+        grp = QButtonGroup(self)
+        for key, _label in self.TYPES:
+            rb = QRadioButton("")
+            self.radio[key] = rb
+            grp.addButton(rb)
+            rb.toggled.connect(self._refresh_list)
+            radio_row.addWidget(rb)
+        radio_row.addStretch()
+        self.radio["include_packages"].setChecked(True)
+        layout.addLayout(radio_row)
+
+        entry_row = QHBoxLayout()
+        entry_row.setSpacing(6)
+        self.ed_name = QLineEdit()
+        entry_row.addWidget(self.ed_name, 1)
+        add_btn = QPushButton("+ 添加")
+        add_btn.clicked.connect(self._add)
+        entry_row.addWidget(add_btn)
+        layout.addLayout(entry_row)
+
+        self._list = QListWidget()
+        self._list.setMinimumHeight(80)
+        layout.addWidget(self._list)
+
+        rm_btn = QPushButton("删除选中")
+        rm_btn.clicked.connect(self._remove)
+        layout.addWidget(rm_btn)
+
+    def _current(self):
+        for key, rb in self.radio.items():
+            if rb.isChecked():
+                return key
+        return "include_packages"
+
+    def _add(self):
+        name = self.ed_name.text().strip()
+        if not name:
+            return
+        key = self._current()
+        self._data[key].append(name)
+        self._refresh_list()
+        self.ed_name.clear()
+
+    def _remove(self):
+        row = self._list.currentRow()
+        if row < 0:
+            return
+        key = self._current()
+        if 0 <= row < len(self._data[key]):
+            del self._data[key][row]
+            self._refresh_list()
+
+    def _refresh_list(self):
+        key = self._current()
+        if getattr(self, "_list", None) is not None:
+            self._list.clear()
+            for item in self._data[key]:
+                self._list.addItem(item)
+        labels = dict(self.TYPES)
+        for k, rb in self.radio.items():
+            rb.setText("%s (%d)" % (labels[k], len(self._data[k])))
+
+    def set_data(self, data):
+        self._data = {key: list(data.get(key, [])) for key, _ in self.TYPES}
+        self._refresh_list()
+
+    def get_data(self):
+        return {key: list(items) for key, items in self._data.items()}
 
 
 class NuitkaGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Nuitka 打包工具")
-        self.resize(1060, 820)
-        self.setMinimumSize(940, 700)
+        self.setMinimumSize(720, 560)
+        # 窗口尺寸自适应屏幕: 低分辨率下不超出屏幕, 高分辨率下保持舒适尺寸
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            w = min(1080, max(720, geo.width() - 40))
+            h = min(860, max(560, geo.height() - 60))
+            self.resize(w, h)
+        else:
+            self.resize(1060, 820)
 
         self.stop_event = threading.Event()
         self.building = False
@@ -524,26 +820,24 @@ class NuitkaGUI(QMainWindow):
         grid.setColumnStretch(1, 1)
         root.addWidget(top)
 
-        # 启用插件 (独立板块, 位于项目区与选项卡之间)
-        root.addWidget(self._build_plugin_group())
-
         # 选项卡
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_basic_tab(), "基本选项")
+        self.tabs.addTab(self._build_plugin_tab(), "插件")
         self.tabs.addTab(self._build_data_tab(), "数据与模块")
         self.tabs.addTab(self._build_win_tab(), "Windows 信息")
         self.tabs.addTab(self._build_advanced_tab(), "高级")
         root.addWidget(self.tabs, 2)
 
-        # 日志区
-        log_group = QGroupBox("构建日志")
-        log_layout = QVBoxLayout(log_group)
-        log_layout.setContentsMargins(10, 16, 10, 10)
+        # 日志区(可折叠, 保留标题与无文字箭头按钮)
+        self.log_box = CollapsibleBox("构建日志")
+        log_layout = QVBoxLayout(self.log_box.content())
+        log_layout.setContentsMargins(10, 8, 10, 10)
         log_layout.setSpacing(6)
         self.log_text = QPlainTextEdit()
         self.log_text.setObjectName("logText")
         self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(130)
+        self.log_text.setMinimumHeight(100)
         log_layout.addWidget(self.log_text, 1)
 
         log_btns = QHBoxLayout()
@@ -561,16 +855,12 @@ class NuitkaGUI(QMainWindow):
             log_btns.addWidget(b)
         log_btns.addStretch()
         log_layout.addLayout(log_btns)
-        root.addWidget(log_group, 1)
+        root.addWidget(self.log_box, 1)
 
         # 底部操作栏
         bottom = QHBoxLayout()
         bottom.setSpacing(10)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.setFixedWidth(180)
-        self.progress.setFixedHeight(22)
+        self.progress = ThreeBodyIndicator()
         self.lbl_status = QLabel("就绪")
         self.lbl_status.setStyleSheet("color:#5a6a7e;")
         self.btn_start = QPushButton("开始打包")
@@ -602,19 +892,36 @@ class NuitkaGUI(QMainWindow):
         scroll.setWidget(content)
         return scroll, content
 
-    def _build_plugin_group(self):
+    def _build_plugin_tab(self):
+        scroll, content = self._scrollable()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 16, 16, 16)
         plugin_group = QGroupBox("启用插件 (可多选)")
         grid = QGridLayout(plugin_group)
-        grid.setContentsMargins(12, 16, 12, 10)
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(4)
+        grid.setContentsMargins(12, 16, 12, 12)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(6)
         cols = 5
         self.plugin_checks = {}
         for i, name in enumerate(PLUGIN_OPTIONS):
             cb = QCheckBox(name)
             self.plugin_checks[name] = cb
             grid.addWidget(cb, i // cols, i % cols)
-        return plugin_group
+        # UPX 勾选后检查是否存在, 缺失时以淡红提示
+        self.plugin_checks["upx"].toggled.connect(self._update_upx_marker)
+        layout.addWidget(plugin_group)
+        layout.addStretch()
+        return scroll
+
+    def _update_upx_marker(self):
+        """UPX 被勾选但系统未安装时, 将选项标记为淡红色(柔和, 不刺眼)。"""
+        cb = self.plugin_checks.get("upx")
+        if cb is None:
+            return
+        if cb.isChecked() and not deps.check_upx():
+            cb.setStyleSheet("QCheckBox{color:#d98a8a;}")
+        else:
+            cb.setStyleSheet("")
 
     def _build_basic_tab(self):
         scroll, content = self._scrollable()
@@ -659,23 +966,18 @@ class NuitkaGUI(QMainWindow):
 
     def _build_data_tab(self):
         scroll, content = self._scrollable()
-        layout = QGridLayout(content)
-        layout.setContentsMargins(14, 12, 14, 14)
-        layout.setHorizontalSpacing(12)
-        layout.setVerticalSpacing(8)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 14, 16, 16)
+        layout.setSpacing(10)
 
-        self.ed_data_dirs = ListEditor("数据目录 (来源=目标子路径)", second_label="目标子路径")
-        self.ed_data_files = ListEditor("数据文件 (来源=目标路径)", second_label="目标路径")
-        self.ed_pkgs = ListEditor("包含包 (--include-package)")
-        self.ed_mods = ListEditor("包含模块 (--include-module)")
-        self.ed_excludes = ListEditor("排除导入 (--nofollow-import-to)")
+        self.ed_data_dirs = RowTableEditor("数据目录")
+        self.ed_data_files = RowTableEditor("数据文件")
+        self.ed_modules = ModuleListEditor()
 
-        layout.addWidget(self.ed_data_dirs, 0, 0)
-        layout.addWidget(self.ed_data_files, 0, 1)
-        layout.addWidget(self.ed_pkgs, 1, 0)
-        layout.addWidget(self.ed_mods, 1, 1)
-        layout.addWidget(self.ed_excludes, 2, 0, 1, 2)
-        layout.setRowStretch(3, 1)
+        layout.addWidget(self.ed_data_dirs)
+        layout.addWidget(self.ed_data_files)
+        layout.addWidget(self.ed_modules)
+        layout.addStretch()
         return scroll
 
     def _build_win_tab(self):
@@ -779,9 +1081,7 @@ class NuitkaGUI(QMainWindow):
             "remove_output": self.chk_remove.isChecked(),
             "data_dirs": self.ed_data_dirs.get_items(),
             "data_files": self.ed_data_files.get_items(),
-            "include_packages": self.ed_pkgs.get_items(),
-            "include_modules": self.ed_mods.get_items(),
-            "exclude_modules": self.ed_excludes.get_items(),
+            **self.ed_modules.get_data(),
             "company_name": self.ed_company.text().strip(),
             "product_name": self.ed_product.text().strip(),
             "file_version": self.ed_file_version.text().strip(),
@@ -811,9 +1111,11 @@ class NuitkaGUI(QMainWindow):
         self.chk_remove.setChecked(bool(cfg.get("remove_output", False)))
         self.ed_data_dirs.set_items(cfg.get("data_dirs", []))
         self.ed_data_files.set_items(cfg.get("data_files", []))
-        self.ed_pkgs.set_items(cfg.get("include_packages", []))
-        self.ed_mods.set_items(cfg.get("include_modules", []))
-        self.ed_excludes.set_items(cfg.get("exclude_modules", []))
+        self.ed_modules.set_data({
+            "include_packages": cfg.get("include_packages", []),
+            "include_modules": cfg.get("include_modules", []),
+            "exclude_modules": cfg.get("exclude_modules", []),
+        })
         self.ed_company.setText(cfg.get("company_name", ""))
         self.ed_product.setText(cfg.get("product_name", ""))
         self.ed_file_version.setText(cfg.get("file_version", ""))
@@ -841,7 +1143,19 @@ class NuitkaGUI(QMainWindow):
         self.setStyleSheet(APP_QSS if theme == "light" else APP_DARK_QSS)
         self.log_text.setStyleSheet(LOG_STYLES[theme])
         self.log_colors = LOG_COLOR_SETS[theme]
+        self.log_box.set_theme(collapsible_qss(theme))
         (self.act_light if theme == "light" else self.act_dark).setChecked(True)
+        self._set_status_color(None)
+        self._update_upx_marker()
+
+    def _status_default_color(self):
+        """状态栏文字默认颜色(按主题)。"""
+        return "#a8adb5" if self.theme == "dark" else "#5a6a7e"
+
+    def _set_status_color(self, color):
+        """设置状态栏文字颜色; color 为 None 时恢复主题默认色。"""
+        self.lbl_status.setStyleSheet(
+            "color:%s;" % (color or self._status_default_color()))
 
     # ---------- 日志 ----------
     def _log(self, text, level="normal"):
@@ -968,17 +1282,17 @@ class NuitkaGUI(QMainWindow):
         self.btn_env.setEnabled(not building)
         self.btn_mingw.setEnabled(not building and not self.env_compiler_ok)
         if building:
-            self.progress.setValue(0)
+            self._set_status_color(None)
+            self.progress.setRunning(True)
             self.lbl_status.setText("正在处理, 请稍候...")
         else:
-            self.progress.setValue(0)
+            self.progress.setRunning(False)
 
     def _on_output(self, line):
         self._log(line)
         low = line.lower()
         for _kw, _label, pct in PROGRESS_STEPS:
             if _kw in low:
-                self.progress.setValue(pct)
                 self.lbl_status.setText("处理进度: %d%%" % pct)
                 break
 
@@ -991,14 +1305,17 @@ class NuitkaGUI(QMainWindow):
 
     def _on_build_done(self, code):
         if code == 0:
-            self.progress.setValue(100)
+            self._set_status_color("#34C759")
+            QTimer.singleShot(2000, lambda: self._set_status_color(None))
             self.lbl_status.setText("打包完成 ✔")
             self._log("========== 打包成功 ==========", "ok")
             QMessageBox.information(self, "完成", "打包成功! 产物已生成到输出目录。")
         elif code == -2:
+            self._set_status_color(None)
             self.lbl_status.setText("已取消")
             self._log("========== 已取消 ==========", "error")
         else:
+            self._set_status_color("#FF3B30")
             self.lbl_status.setText("打包失败")
             self._log("========== 打包失败 (退出码 %s) ==========" % code, "error")
             if deps.python_requires_msvc() and not deps.find_msvc():
