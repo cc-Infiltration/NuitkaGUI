@@ -101,6 +101,108 @@ _C_TOGO_RE = re.compile(r"(\d+) modules? to go", re.I)
 _C_DONE_RE = re.compile(r"completed c compilation of", re.I)
 _C_BULK_RE = re.compile(r"completed (\d+) c compilation unit", re.I)
 
+# 打包失败诊断规则: (正则, 问题标题, 修复建议)。
+# 按优先级排列, 命中即认为该原因(针对日志全文匹配)。
+# 注意: 命令回显行也会出现在日志中, 规则必须匹配真正的报错文案,
+# 不要用命令行参数名(如 --file-version)做关键词, 否则会误报。
+# 规则中可用命名组 (?P<path>...) 提取实际路径, 通过 {path} 填入标题/建议。
+FAILURE_RULES = (
+    (r"icon path ['\"](?P<path>[^'\"]+)['\"] does not exist",
+     "图标文件路径不存在",
+     "请检查「Windows 信息」页签的图标设置: 当前路径 '{path}' 不存在, 请重新选择有效的 .ico 文件"),
+    (r"(?:sconslockfailure: )?timeout waiting for lock on ['\"](?P<path>[^'\"]+)['\"]"
+     r"|sconslockfailure",
+     "Scons 编译锁超时 (缓存被占用)",
+     "通常是有另一个 Nuitka 打包进程在运行, 或杀毒软件锁定了 Nuitka 缓存。"
+     "建议: ① 关闭其它打包窗口后重试; ② 仍失败则删除缓存目录 %LOCALAPPDATA%\\Nuitka 后重试; "
+     "③ 杀毒软件拦截请把 Nuitka 缓存目录加入白名单。 (锁文件: {path})"),
+    (r"cannot use '--mingw64' on python|mingw64.{0,40}not supported|"
+     r"no suitable c compiler|did not find.{0,40}(c compiler|compiler)",
+     "缺少可用的 C 编译器",
+     "Python 3.13+ 必须使用 MSVC: winget install Microsoft.VisualStudio.2022.BuildTools"),
+    (r"unknown plug-?in",
+     "插件名不正确",
+     "检查插件名拼写与大小写(如 pyside6/pyqt6 均为小写), 并确认已安装对应依赖"),
+    (r"invalid version number",
+     "Windows 版本号格式错误",
+     "版本号只能包含数字和点(如 1.0.0), 不要带 V/v 前缀"),
+    (r"no module named|modulenotfounderror|importerror",
+     "目标脚本缺少 Python 依赖",
+     "先安装日志中提到的模块: pip install <模块名>"),
+    (r"cannot add data (file|dir)|include-data-.*not exist|source.*does not exist",
+     "数据文件/目录路径错误",
+     "检查「数据与模块」中填写的本地路径是否存在"),
+    (r"no space left on device|磁盘空间不足|insufficient disk space",
+     "磁盘空间不足",
+     "清理磁盘空间, 或把输出目录改到空间充足的磁盘"),
+    (r"permission denied|access is denied|拒绝访问",
+     "没有写入权限",
+     "以管理员身份运行程序, 或把输出目录改到可写位置"),
+    (r"fatal error c\d{4}|error c\d{3,4}|\.c\(.+\)\s*:\s*error",
+     "C 编译器报错 (目标代码或第三方扩展)",
+     "查看日志中具体 C 错误行; 多为第三方库需更新、或缺少 C 头文件"),
+    (r"failed unexpectedly in scons|scons.*backend",
+     "C 编译阶段异常退出 (Scons)",
+     "多为编译器或缓存问题: 清理 Nuitka 缓存后重试, 必要时重装 MSVC Build Tools"),
+    (r"unknown option|no such option|not recognized option|option[^\n]{0,25}unknown",
+     "参数不被当前 Nuitka 支持",
+     "升级 Nuitka: pip install -U nuitka"),
+    (r"failed to download|download.{0,20}failed|timed out|无法连接|网络错误",
+     "网络/下载失败",
+     "检查网络后重试; 使用代理时请先配置系统代理"),
+    (r"system cannot find|系统找不到指定的文件|winerror 2",
+     "找不到命令或文件",
+     "脚本/输出路径不存在; 打包需要本机已安装 Python 且包含 Nuitka"),
+    (r"syntaxerror|indentationerror",
+     "目标脚本存在语法错误",
+     "先在 IDE 中运行目标脚本, 确认无语法错误再打包"),
+    (r"failed to create|cannot create output|could not create",
+     "无法创建输出目录/文件",
+     "检查输出目录路径是否合法、权限是否足够"),
+)
+
+# 没有命中任何具体规则时的兜底提示
+_FALLBACK_HINT = ("未能识别具体原因",
+                  "请查看日志中 FATAL 行后面的具体错误描述, 或把日志发给我们排查")
+
+
+def analyze_failure(log_text):
+    """从构建日志中识别常见失败原因。
+
+    返回 [(问题标题, 修复建议), ...], 去重保序; 没有命中时返回空列表。
+    规则若定义了命名组 path, 会把实际路径动态填入标题/建议中的 {path}。
+    """
+    low = (log_text or "").lower()
+    found = []
+    for pattern, title, fix in FAILURE_RULES:
+        try:
+            m = re.search(pattern, low)
+        except re.error:
+            continue
+        if not m:
+            continue
+        try:
+            path = m.group("path")
+        except IndexError:
+            path = None
+        if path:
+            title = title.replace("{path}", path)
+            fix = fix.replace("{path}", path)
+        else:
+            # 未捕获到具体路径时, 去掉建议中依赖路径的片段
+            fix = fix.replace(" (锁文件: {path})", "").replace("{path}", "")
+        found.append((title, fix))
+    # 未命中任何具体规则时, 才显示兜底提示, 避免和具体诊断混在一起
+    if not found:
+        found.append(_FALLBACK_HINT)
+    seen = set()
+    uniq = []
+    for title, fix in found:
+        if title not in seen:
+            seen.add(title)
+            uniq.append((title, fix))
+    return uniq
+
 # 日志区样式与文字颜色(按主题)
 LOG_STYLES = {
     "light": ("QPlainTextEdit{background:#ffffff;color:#1f2328;"
@@ -715,13 +817,28 @@ class NuitkaGUI(QMainWindow):
         grid.setVerticalSpacing(6)
         cols = 5
         self.plugin_checks = {}
-        for i, name in enumerate(PLUGIN_OPTIONS):
+        cell = 0
+        for name in PLUGIN_OPTIONS:
+            if name == "dll-files":  # 单独放到底部兜底区域
+                continue
             cb = QCheckBox(name)
             self.plugin_checks[name] = cb
-            grid.addWidget(cb, i // cols, i % cols)
+            grid.addWidget(cb, cell // cols, cell % cols)
+            cell += 1
         # UPX 勾选后检查是否存在, 缺失时以淡红提示
         self.plugin_checks["upx"].toggled.connect(self._update_upx_marker)
         layout.addWidget(plugin_group)
+
+        # dll-files 单独放在下面, 作为第三方包 dll 的兜底选项
+        fallback_group = QGroupBox("兜底选项")
+        fallback_layout = QVBoxLayout(fallback_group)
+        fallback_layout.setContentsMargins(12, 14, 12, 12)
+        cb_dll = QCheckBox("dll-files")
+        cb_dll.setToolTip("根据第三方包的配置文件，自动将相关的dll打包\n"
+                          "注意: 这可能会增加构建产物的大小与启动速度, 请谨慎使用")
+        self.plugin_checks["dll-files"] = cb_dll
+        fallback_layout.addWidget(cb_dll)
+        layout.addWidget(fallback_group)
         layout.addStretch()
         return scroll
 
@@ -1061,6 +1178,12 @@ class NuitkaGUI(QMainWindow):
         if not cfg["script"].lower().endswith(".py"):
             QMessageBox.warning(self, "提示", "请选择 .py 脚本文件。")
             return
+        if cfg.get("icon") and not os.path.isfile(cfg["icon"]):
+            QMessageBox.critical(
+                self, "错误",
+                "图标文件不存在:\n%s\n\n"
+                "请到「Windows 信息」页签 → 图标, 重新选择有效的 .ico 文件。" % cfg["icon"])
+            return
         save_config(cfg)
         self.stop_event.clear()
         self._current_task = "build"
@@ -1154,13 +1277,27 @@ class NuitkaGUI(QMainWindow):
             self._set_status_color("#FF3B30")
             self.lbl_status.setText("打包失败")
             self._log("========== 打包失败 (退出码 %s) ==========" % code, "error")
-            if deps.python_requires_msvc() and not deps.find_msvc():
-                self._log("提示: Python 3.13+ 需要 MSVC 编译器, 请安装 Build Tools: "
-                          "winget install Microsoft.VisualStudio.2022.BuildTools", "warn")
-            QMessageBox.critical(
-                self, "失败",
-                "打包失败, 退出码 %s。请查看日志。\n"
-                "若 Nuitka 报「unknown option」, 请升级 Nuitka: pip install -U nuitka" % code)
+            # 从日志中自动诊断失败原因, 给出针对性提示
+            findings = analyze_failure(self.log_text.toPlainText())
+            if (deps.python_requires_msvc() and not deps.find_msvc()
+                    and not any("MSVC" in title for title, _ in findings)):
+                findings.append(
+                    ("缺少 MSVC 编译器",
+                     "安装 Microsoft C++ Build Tools: "
+                     "winget install Microsoft.VisualStudio.2022.BuildTools"))
+            for title, fix in findings[:3]:
+                self._log("诊断: %s" % title, "error")
+                self._log("建议: %s" % fix, "warn")
+            if not findings:
+                self._log("未能识别具体原因, 请查看上方日志中的 FATAL/ERROR 行。", "warn")
+            lines = ["打包失败 (退出码 %s)。" % code, ""]
+            if findings:
+                for title, fix in findings[:2]:
+                    lines.append("• %s" % title)
+                    lines.append("  建议: %s" % fix)
+            else:
+                lines.append("未识别到具体原因, 请查看日志中的错误信息。")
+            QMessageBox.critical(self, "打包失败", "\n".join(lines))
 
     def _on_mingw_done(self, code):
         self._log("MinGW64 下载流程结束。", "cmd")
