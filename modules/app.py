@@ -205,9 +205,10 @@ def analyze_failure(log_text):
 
 # 日志区样式与文字颜色(按主题)
 LOG_STYLES = {
-    "light": ("QPlainTextEdit{background:#ffffff;color:#1f2328;"
-              "font-family:Consolas;font-size:9pt;border:1px solid #d5dce5;"
-              "border-radius:6px;}"),
+    "light": ("QPlainTextEdit{background:#f7f9fc;color:#1f2328;"
+              "font-family:Consolas;font-size:9.5pt;padding:6px;"
+              "border:1px solid #b8c6d9;border-radius:6px;"
+              "selection-background-color:#cfe4fb;}"),
     "dark": ("QPlainTextEdit{background:#111214;color:#d4d4d4;"
              "font-family:Consolas;font-size:9pt;border:1px solid #3f4248;"
              "border-radius:6px;}"),

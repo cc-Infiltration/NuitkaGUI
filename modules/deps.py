@@ -263,9 +263,8 @@ def check_compiler():
                         "未检测到", MSVC_HINT if msvc_required else ""))
 
     if msvc_required:
-        results.append(("MinGW64", "warn",
-                        "Python %d.%d+ 下 Nuitka 不支持 MinGW64" % sys.version_info[:2],
-                        "请安装上方要求的 MSVC (Microsoft C++ Build Tools)"))
+        # Python 3.13+ 下不检测 MinGW64 (Nuitka 不支持), 避免出现多余提示
+        pass
     else:
         mingw_paths = _find_mingw_in_cache() + _find_mingw_common()
         if mingw_paths:
