@@ -18,6 +18,14 @@ Nuitka 的图形化打包工具，使用 **PySide6** 开发，为 Python 程序�
 -  **亮色/暗色主题**：菜单「视图」一键切换，选择自动保存
 -  **配置持久化**：所有设置自动保存到 `~/.nuitka_gui/config.json`，可随时保存/加载
 
+## 界面预览
+
+内置亮色/暗色两套主题，可通过菜单「视图」一键切换：
+
+| 暗色主题 | 亮色主题 |
+| --- | --- |
+| ![暗色主题](MdImages/主界面Dark.png) | ![亮色主题](MdImages/主界面ling.png) |
+
 ## 环境要求
 
 | 依赖 | 说明 |
@@ -76,6 +84,7 @@ NuitkaGUI/
 ├── deps.py       # 环境检查（Nuitka / MSVC / MinGW64 检测与修复建议）
 ├── config.py     # 配置 JSON 持久化
 ├── requirements.txt  # 运行依赖清单
+├── MdImages/     # 界面预览截图（README 使用）
 ├── a.ico         # 程序图标
 └── README.md
 ```
