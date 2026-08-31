@@ -210,7 +210,7 @@ def run_build(log_queue, stop_event, cfg):
                                "请安装 Python 后执行: pip install nuitka"))
         log_queue.put(("done", -1))
         return
-    log_queue.put(("cmd", " ".join(cmd)))
+    log_queue.put(("cmd", '$env:CL="/utf-8";' + " ".join(cmd)))
     code = run_process(cmd, cwd=os.path.dirname(cfg.get("script") or "") or None,
                        log_queue=log_queue, stop_event=stop_event)
     log_queue.put(("done", code))
@@ -222,6 +222,9 @@ def run_process(cmd, cwd, log_queue, stop_event):
     返回退出码: 0 成功, -1 启动失败, -2 用户取消
     """
     try:
+        # 设置 CL=/utf-8 环境变量, 使 MSVC 编译器以 UTF-8 编码处理源文件
+        env = os.environ.copy()
+        env["CL"] = "/utf-8"
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         proc = subprocess.Popen(
             cmd,
@@ -231,6 +234,7 @@ def run_process(cmd, cwd, log_queue, stop_event):
             bufsize=1,
             creationflags=creationflags,
             cwd=cwd or None,
+            env=env,
         )
     except Exception as exc:
         log_queue.put(("error", "无法启动命令: %s" % exc))
