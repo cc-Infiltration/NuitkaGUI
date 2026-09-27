@@ -7,6 +7,10 @@ import os
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".nuitka_gui")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
+# 主脚本未填写时的默认目标: 本工具自身入口 (项目根目录的 main.py)
+DEFAULT_SCRIPT = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"))
+
 DEFAULT_CONFIG = {
     "script": "",
     "output_dir": "",

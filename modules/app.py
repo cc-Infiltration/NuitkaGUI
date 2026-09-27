@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from . import deps
 from .builder import build_command, run_build
-from .config import DEFAULT_CONFIG, load_config, save_config
+from .config import DEFAULT_CONFIG, DEFAULT_SCRIPT, load_config, save_config
 
 
 def _load_qss(name):
@@ -1000,7 +1000,7 @@ class NuitkaGUI(QMainWindow):
         self._ensure_all_tabs()  # 读取完整配置前确保所有页签已构建
         cfg = dict(DEFAULT_CONFIG)
         cfg.update({
-            "script": self.ed_script.text().strip(),
+            "script": self.ed_script.text().strip() or DEFAULT_SCRIPT,
             "output_dir": self.ed_output_dir.text().strip(),
             "output_filename": self.ed_output_name.text().strip(),
             "mode": MODE_FROM_LABEL.get(self.cb_mode.currentText(), "onefile"),
@@ -1169,14 +1169,14 @@ class NuitkaGUI(QMainWindow):
         self._worker.start(target, queue, self.stop_event, *args)
 
     def _start_build(self):
+        if not self.ed_script.text().strip():
+            self.ed_script.setText(DEFAULT_SCRIPT)  # 未填主脚本时默认打包本工具自身
         cfg = self._collect_config()
-        if not cfg["script"]:
-            QMessageBox.warning(self, "提示", "请先选择要打包的主脚本。")
+        script = cfg["script"]
+        if not os.path.isfile(script):
+            QMessageBox.critical(self, "错误", "脚本文件不存在:\n%s" % script)
             return
-        if not os.path.isfile(cfg["script"]):
-            QMessageBox.critical(self, "错误", "脚本文件不存在:\n%s" % cfg["script"])
-            return
-        if not cfg["script"].lower().endswith(".py"):
+        if not script.lower().endswith(".py"):
             QMessageBox.warning(self, "提示", "请选择 .py 脚本文件。")
             return
         if cfg.get("icon") and not os.path.isfile(cfg["icon"]):
