@@ -55,24 +55,7 @@ python -m nuitka --standalone --onefile --enable-plugin=pyside6 ^
 - **Python 3.13 为什么没 MinGW64 下载？** → 3.13+ 不支持 MinGW64，需安装 MSVC
 
 ## 更新日志
-
-### v1.1.0 (2026-10-02)
-
-**新特性**
-- Linux / macOS 跨平台适配，自动跳过 Windows 专属 Flag
-- config.json SHA-256 完整性校验 + `.tmp` 原子写入
-- TOCTOU 防御：后台线程二次校验脚本/图标存在性
-- 命令回显脱敏（builder + deps 全覆盖）
-
-**问题修复**
-- 取消打包硬杀进程树（`taskkill /T /F` / `os.killpg`），修复 scons/gcc 残留
-- 预创建 `NUITKA_CACHE_DIR`，修复 Nuitka 4.2.x `FileNotFoundError`
-- Qt 插件多布局探测（`Qt5/plugins` / `Qt6/plugins` / `PySide6/plugins`）
-- `nuitka>=4.2.1,<4.3.0`，修复 4.1.3 在 Python 3.13 上的 PyQt5 插件检测失败
-
-### v1.0.0 (2026-09-27)
-
-首个稳定版本。
+[详细日志](https://github.com/cc-Infiltration/NuitkaGUI/releases/tag/1.1.0)
 
 ## License
 
