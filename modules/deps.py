@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 
-from .builder import resolve_python, run_process
+from .builder import resolve_python, run_process, _mask_path_arg
 
 CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 _VERSION_RE = re.compile(r"^\d+(\.\d+)+")
@@ -67,17 +67,23 @@ def check_upx():
     """检测 UPX 是否可用 (PATH 或常见安装位置)。"""
     if shutil.which("upx"):
         return True
-    for cand in (r"C:\upx\upx.exe",
-                 r"C:\Program Files\upx\upx.exe",
-                 r"C:\Program Files (x86)\upx\upx.exe"):
-        if os.path.isfile(cand):
-            return True
+    if os.name == "nt":
+        for cand in (r"C:\upx\upx.exe",
+                     r"C:\Program Files\upx\upx.exe",
+                     r"C:\Program Files (x86)\upx\upx.exe"):
+            if os.path.isfile(cand):
+                return True
+    else:
+        for cand in ("/usr/bin/upx", "/usr/local/bin/upx", "/opt/homebrew/bin/upx"):
+            if os.path.isfile(cand):
+                return True
     return False
 
 
 def python_requires_msvc():
-    """Python 3.13+ 需要 MSVC 编译器 (Nuitka 不支持 MinGW64)"""
-    return sys.version_info >= (3, 13)
+    """Windows 上 Python 3.13+ 需要 MSVC 编译器 (Nuitka 不支持 MinGW64);
+    Linux / macOS 上 Nuitka 默认使用系统 gcc/clang, 不强制 MSVC。"""
+    return os.name == "nt" and sys.version_info >= (3, 13)
 
 
 def _find_cl_in(base):
@@ -100,9 +106,10 @@ def _find_cl_in(base):
 def find_msvc():
     """检测是否安装 MSVC (Visual Studio / Build Tools)
 
-    优先通过 vswhere 查询, 失败时探测常见安装路径与 PATH
-    返回 cl.exe 路径列表。
+    仅 Windows 有效; Linux/macOS 上 Nuitka 用系统 gcc/clang, 直接返回 [].
     """
+    if os.name != "nt":
+        return []
     found = []
     prog_files = [os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")]
     # vswhere
@@ -233,22 +240,58 @@ MSVC_HINT = ("请安装 Microsoft C++ Build Tools:\n"
              "    winget install Microsoft.VisualStudio.2022.BuildTools\n"
              "或访问 https://visualstudio.microsoft.com/downloads/ 安装「使用 C++ 的桌面开发」工作负载。")
 
+GCC_LINUX_HINT = ("请安装 GNU C 编译器:\n"
+                  "    Debian/Ubuntu:  sudo apt install build-essential\n"
+                  "    Fedora/RHEL:    sudo dnf install gcc gcc-c++\n"
+                  "    Arch:           sudo pacman -S base-devel\n"
+                  "    macOS (Homebrew): brew install gcc (或自带 clang)")
+
+
+def _probe_compiler_version(cmd_list):
+    """运行 --version 并取首行, 失败返回空串。"""
+    proc = _probe(cmd_list, timeout=10)
+    return _first_line(proc.stdout) if proc else ""
+
 
 def check_compiler():
     """检测 C 编译器。
 
     返回 (是否可用, [(名称, 状态, 详情, 修复建议), ...])。
-    - Python <= 3.12: 可用 = 系统 gcc / MSVC / MinGW64 任一存在。
-    - Python >= 3.13: 可用 = MSVC 存在 (Nuitka 不支持 MinGW64)。
+
+    Windows: Python <= 3.12 用 gcc / MSVC / MinGW64 任一; Python 3.13+ 强制 MSVC。
+    Linux / macOS: gcc 或 clang 任一即可 (Nuitka 默认使用), 无 MinGW/MSVC 概念。
     """
     results = []
     ok = False
+
+    # --- Linux / macOS 分支 ---
+    if os.name != "nt":
+        # gcc
+        gcc = shutil.which("gcc")
+        if gcc:
+            ver = _probe_compiler_version([gcc, "--version"])
+            results.append(("系统 gcc", "ok", "%s (%s)" % (gcc, ver or "版本未知"), ""))
+            ok = True
+        else:
+            results.append(("系统 gcc", "error", "未检测到", GCC_LINUX_HINT))
+
+        # clang (gcc 的替代品, 并列列出)
+        clang = shutil.which("clang")
+        if clang:
+            ver = _probe_compiler_version([clang, "--version"])
+            results.append(("系统 clang", "ok", "%s (%s)" % (clang, ver or "版本未知"), ""))
+            ok = True
+        else:
+            results.append(("系统 clang", "warn", "未加入 PATH (gcc 可用即可)", ""))
+
+        return ok, results
+
+    # --- Windows 分支 ---
     msvc_required = python_requires_msvc()
 
     gcc = shutil.which("gcc")
     if gcc:
-        proc = _probe([gcc, "--version"])
-        ver = _first_line(proc.stdout) if proc else ""
+        ver = _probe_compiler_version([gcc, "--version"])
         results.append(("系统 gcc", "ok", "%s (%s)" % (gcc, ver or "版本未知"), ""))
         ok = True
     else:
@@ -308,10 +351,12 @@ def run_env_check():
 
 
 def run_mingw_download(log_queue, stop_event):
-    """通过一次极简模块编译触发 Nuitka 自动下载 MinGW64 并验证可用性。
-
-    Python 3.13+ 不支持 MinGW64, 直接给出安装 MSVC 的指引。
-    """
+    """预下载编译器 — Linux/macOS 不需要 MinGW, 直接提示装 gcc/clang。"""
+    if os.name != "nt":
+        log_queue.put(("error", "Linux / macOS 使用系统 gcc/clang 即可编译, 无需 MinGW64。"))
+        log_queue.put(("error", GCC_LINUX_HINT))
+        log_queue.put(("mingw_done", -1))
+        return
     if python_requires_msvc():
         log_queue.put(("error", "Python %s 不支持自动下载 MinGW64 编译器 (Nuitka 限制)。"
                        % sys.version.split()[0]))
@@ -338,7 +383,7 @@ def run_mingw_download(log_queue, stop_event):
             "--output-dir=%s" % out,
             probe,
         ]
-        log_queue.put(("cmd", " ".join(cmd)))
+        log_queue.put(("cmd", " ".join(_mask_path_arg(a) for a in cmd)))
         code = run_process(cmd, cwd=tmp, log_queue=log_queue, stop_event=stop_event)
         if code == 0:
             log_queue.put(("ok", "MinGW64 下载并验证完成, 现在可以直接打包了。"))

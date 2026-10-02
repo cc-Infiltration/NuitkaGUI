@@ -106,20 +106,28 @@ _C_BULK_RE = re.compile(r"completed (\d+) c compilation unit", re.I)
 # 注意: 命令回显行也会出现在日志中, 规则必须匹配真正的报错文案,
 # 不要用命令行参数名(如 --file-version)做关键词, 否则会误报。
 # 规则中可用命名组 (?P<path>...) 提取实际路径, 通过 {path} 填入标题/建议。
+_IS_WIN = os.name == "nt"  # 平台判断, 用于 FAILURE_RULES 里 Windows 专属提示
+
 FAILURE_RULES = (
     (r"icon path ['\"](?P<path>[^'\"]+)['\"] does not exist",
      "图标文件路径不存在",
-     "请检查「Windows 信息」页签的图标设置: 当前路径 '{path}' 不存在, 请重新选择有效的 .ico 文件"),
+     ("请检查「Windows 信息」页签的图标设置: 当前路径 '{path}' 不存在, "
+      "请重新选择有效的 .ico 文件") if _IS_WIN
+     else ("图标路径 '{path}' 不存在, 请重新选择有效图标文件(.png/.ico/.svg 等)")),
     (r"(?:sconslockfailure: )?timeout waiting for lock on ['\"](?P<path>[^'\"]+)['\"]"
      r"|sconslockfailure",
      "Scons 编译锁超时 (缓存被占用)",
      "通常是有另一个 Nuitka 打包进程在运行, 或杀毒软件锁定了 Nuitka 缓存。"
-     "建议: ① 关闭其它打包窗口后重试; ② 仍失败则删除缓存目录 %LOCALAPPDATA%\\Nuitka 后重试; "
-     "③ 杀毒软件拦截请把 Nuitka 缓存目录加入白名单。 (锁文件: {path})"),
+     + (("建议: ① 关闭其它打包窗口后重试; ② 仍失败则删除缓存目录 %%LOCALAPPDATA%%\\Nuitka 后重试; "
+        "③ 杀毒软件拦截请把 Nuitka 缓存目录加入白名单。") if _IS_WIN
+        else ("建议: ① 关闭其它打包窗口后重试; ② 仍失败则删除 ~/.cache/Nuitka 后重试。"))
+     + " (锁文件: {path})"),
     (r"cannot use '--mingw64' on python|mingw64.{0,40}not supported|"
      r"no suitable c compiler|did not find.{0,40}(c compiler|compiler)",
      "缺少可用的 C 编译器",
-     "Python 3.13+ 必须使用 MSVC: winget install Microsoft.VisualStudio.2022.BuildTools"),
+     (("Python 3.13+ 必须使用 MSVC: winget install Microsoft.VisualStudio.2022.BuildTools") if _IS_WIN
+      else ("请安装 gcc/clang: sudo apt install build-essential (Debian/Ubuntu) / "
+            "sudo dnf install gcc gcc-c++ (Fedora) / brew install gcc (macOS)"))),
     (r"unknown plug-?in",
      "插件名不正确",
      "检查插件名拼写与大小写(如 pyside6/pyqt6 均为小写), 并确认已安装对应依赖"),
@@ -859,10 +867,11 @@ class NuitkaGUI(QMainWindow):
         layout.setContentsMargins(16, 14, 16, 16)
         layout.setSpacing(10)
 
-        # 图标
+        # 图标 (Windows 支持 .ico 嵌入 PE, 跨平台仅打包进产物供运行时使用)
         icon_row = QHBoxLayout()
         icon_row.setSpacing(8)
-        icon_row.addWidget(QLabel("图标 (.ico):"))
+        icon_label = "图标 (.ico):" if os.name == "nt" else "图标 (可选, 任意格式):"
+        icon_row.addWidget(QLabel(icon_label))
         self.ed_icon = QLineEdit()
         icon_row.addWidget(self.ed_icon, 1)
         btn_icon = QPushButton("浏览...")
@@ -990,8 +999,11 @@ class NuitkaGUI(QMainWindow):
             self.ed_output_dir.setText(path)
 
     def _pick_icon(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择图标", "", "图标文件 (*.ico);;所有文件 (*.*)")
+        if os.name == "nt":
+            flt = "图标文件 (*.ico);;所有文件 (*.*)"
+        else:
+            flt = "图标文件 (*.ico *.png *.svg *.icns);;所有文件 (*.*)"
+        path, _ = QFileDialog.getOpenFileName(self, "选择图标", "", flt)
         if path:
             self.ed_icon.setText(path)
 
@@ -1136,12 +1148,21 @@ class NuitkaGUI(QMainWindow):
             return "warn"
 
         self.env_nuitka_ok = status_of("Nuitka") != "error"
-        self.env_compiler_ok = any(
-            status_of(name) == "ok"
-            for name in ("MSVC", "系统 gcc", "MinGW64"))
+        if os.name == "nt":
+            self.env_compiler_ok = any(
+                status_of(name) == "ok"
+                for name in ("MSVC", "系统 gcc", "MinGW64"))
+        else:
+            # Linux / macOS: gcc 或 clang 任一 OK 即可
+            self.env_compiler_ok = any(
+                status_of(name) == "ok"
+                for name in ("系统 gcc", "系统 clang"))
 
         self.btn_env.setEnabled(True)
-        if deps.python_requires_msvc():
+        if os.name != "nt":
+            self.btn_mingw.setText("gcc 安装指引")
+            self.btn_mingw.setToolTip("Linux / macOS 使用系统 gcc/clang 编译")
+        elif deps.python_requires_msvc():
             self.btn_mingw.setText("安装 MSVC 指引")
             self.btn_mingw.setToolTip("Python 3.13+ 需要 MSVC 编译器")
         else:
@@ -1182,9 +1203,15 @@ class NuitkaGUI(QMainWindow):
         if cfg.get("icon") and not os.path.isfile(cfg["icon"]):
             QMessageBox.critical(
                 self, "错误",
-                "图标文件不存在:\n%s\n\n"
-                "请到「Windows 信息」页签 → 图标, 重新选择有效的 .ico 文件。" % cfg["icon"])
+                "图标文件不存在:\n%s\n\n请到「基本信息」→ 图标, 重新选择有效图标文件。"
+                % cfg["icon"])
             return
+        if os.name == "nt" and cfg.get("icon") and not cfg["icon"].lower().endswith(".ico"):
+            # Windows 下 --windows-icon-from-ico 只接受 .ico (多尺寸打包在一个文件里)
+            QMessageBox.warning(
+                self, "提示",
+                "Windows 平台建议使用 .ico 格式图标 (含多种尺寸)。\n"
+                "当前选择非 .ico 文件, Nuitka 只会把它作为数据文件打进去, 不会嵌入 PE 图标。")
         save_config(cfg)
         self.stop_event.clear()
         self._current_task = "build"

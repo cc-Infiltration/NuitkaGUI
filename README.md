@@ -1,105 +1,78 @@
-# NuitkaGUI
+﻿# NuitkaGUI
 
-Nuitka 的图形化打包工具，使用 **PySide6** 开发，为 Python 程序提供可视化的一键打包能力。
+Nuitka 的图形化打包工具，**PySide6** 开发，Python 程序一键打包。
 
-[![Python](https://img.shields.io/badge/Python-3.13-blue.svg)]()
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)]()
 [![GUI](https://img.shields.io/badge/GUI-PySide6-green.svg)]()
+[![Version](https://img.shields.io/badge/Version-1.1.0-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## 特性
 
--  **多种打包模式**：单文件 (`--onefile`)、单目录 (`--standalone`)、模块 (`--module`)
--  **插件多选**：tk-inter、PySide6、PyQt5/6、upx 等常用 Nuitka 插件，复选框自由组合
--  **数据与模块管理**：包含数据目录/文件、包含包/模块、排除导入
--  **解决中文元数据问题**：包含数据目录/文件、包含包/模块、排除导入
--  **Windows 元数据**：公司名、产品名、文件/产品版本、描述、版权（写入 exe 属性，版本号输入框自动校验格式）
--  **环境检查**：自动检测 Python / Nuitka / C 编译器（MSVC / MinGW64），提供缺失项修复建议
--  **不卡顿的并发**：打包、下载、环境检查均在后台线程执行，通过 Qt 信号槽回传日志，界面始终响应
--  **阶段进度条**：实时解析 Nuitka 输出，按阶段（下载→编译→链接→产物）显示进度百分比
--  **亮色/暗色主题**：菜单「视图」一键切换，选择自动保存
--  **配置持久化**：所有设置自动保存到 `~/.nuitka_gui/config.json`，可随时保存/加载
+- **多模式打包**：单文件 (`--onefile`)、单目录 (`--standalone`)、模块 (`--module`)
+- **插件多选**：PySide6 / PyQt5 / PyQt6 / tk-inter / upx 复选框自由组合
+- **数据与模块**：包含数据目录/文件、包含包/模块、排除导入
+- **Windows 元数据**：公司/产品名、版本号、描述、版权（版本号自动校验）
+- **阶段进度条**：实时解析 Nuitka 输出，按 下载→编译→链接→产物 推进
+- **不卡顿并发**：打包/下载/环境检查均在后台线程，Qt 信号槽回传日志
+- **跨平台**：Windows / Linux / macOS 自动适配构建命令
+- **安全加固**：config.json SHA-256 校验、TOCTOU 二次校验、命令回显脱敏
+
+## 快速开始
+
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+| 依赖 | 安装 |
+|------|------|
+| Python | 3.10+（3.13.7 已验证） |
+| Nuitka | 含在 requirements.txt |
+| PySide6 | 含在 requirements.txt |
+
+> **C 编译器**：Python 3.13+ 需 MSVC (`winget install Microsoft.VisualStudio.2022.BuildTools`)；3.12 及以下首次打包自动下载 MinGW64。
 
 ## 界面预览
-
-内置亮色/暗色两套主题，可通过菜单「视图」一键切换：
 
 | 暗色主题 | 亮色主题 |
 | --- | --- |
 | ![暗色主题](MdImages/主界面Dark.png) | ![亮色主题](MdImages/主界面ling.png) |
 
-## 环境要求
-
-| 依赖 | 说明 |
-| --- | --- |
-| Python | 3.10+（本项目在 3.13.7 验证） |
-| Nuitka | `pip install nuitka` |
-| PySide6 | `pip install PySide6` |
-
-> **C 编译器说明**
-> - **Python 3.13+**：Nuitka 不支持 MinGW64，需安装 **Microsoft C++ Build Tools**（MSVC），
->   命令行安装：`winget install Microsoft.VisualStudio.2022.BuildTools`
-> - **Python 3.12 及以下**：首次打包时 Nuitka 会自动下载 MinGW64（工具默认开启 `--assume-yes-for-downloads` 自动确认）
-
-## 安装与启动
+## 打包本项目
 
 ```bash
-# 1. 安装依赖（依赖清单见 requirements.txt）
-pip install -r requirements.txt
-
-# 2. 启动
-python main.py
-```
-
-> 手动安装等价命令：`pip install nuitka PySide6`
-
-## 使用说明
-
-1. **项目区**：选择主脚本（`.py`）、输出目录、输出文件名、打包模式、控制台保留/隐藏
-2. **启用插件**：勾选需要的 Nuitka 插件（可多选）
-3. **选项卡**：
-   - 基本选项：图标 (.ico)、LTO、并行任务数、清理旧构建缓存
-   - 数据与模块：数据目录/文件、包含包/模块、排除导入
-   - Windows 信息：文件属性元数据（公司、产品、版本号等）
-   - 高级：附加 Nuitka 参数
-4. **环境检查**：首次使用建议点击「环境检查」，确认 Nuitka 与编译器就绪
-5. **开始打包**：点击后后台执行，日志区实时输出、进度条按阶段推进，可随时取消
-
-## 打包本项目为可执行文件
-
-```bash
-python -m nuitka --standalone --onefile --enable-plugin=pyside6 \
-  --windows-console-mode=disable --windows-icon-from-ico=a.ico \
-  --include-data-files=a.ico=a.ico --output-filename=NuitkaGUI \
+python -m nuitka --standalone --onefile --enable-plugin=pyside6 ^
+  --windows-console-mode=disable --windows-icon-from-ico=a.ico ^
+  --include-data-files=a.ico=a.ico --output-filename=NuitkaGUI ^
   --output-dir=dist --jobs=4 --assume-yes-for-downloads main.py
 ```
 
-产物：`dist/NuitkaGUI.exe`（单文件、无控制台窗口、内置图标）。
+## FAQ
 
-## 项目结构
+- **`unknown plug-in 'PySide6' in wrong case`？** → Nuitka 插件名小写（`pyside6`），工具已自动处理
+- **`Invalid version number --file-version='V1.0.0'`？** → 版本号必须纯数字点分，输入框已自动清洗前缀
+- **Python 3.13 为什么没 MinGW64 下载？** → 3.13+ 不支持 MinGW64，需安装 MSVC
 
-```
-NuitkaGUI/
-├── main.py       # 程序入口（QApplication + 图标 + 窗口）
-├── app.py        # PySide6 GUI 主界面（主题、布局、信号槽并发）
-├── builder.py    # Nuitka 命令构造与子进程执行
-├── deps.py       # 环境检查（Nuitka / MSVC / MinGW64 检测与修复建议）
-├── config.py     # 配置 JSON 持久化
-├── requirements.txt  # 运行依赖清单
-├── MdImages/     # 界面预览截图（README 使用）
-├── a.ico         # 程序图标
-└── README.md
-```
+## 更新日志
 
-## 常见问题
+### v1.1.0 (2026-10-02)
 
-**Q：打包报 `unknown plug-in 'PySide6' in wrong case`？**
-A：Nuitka 插件名区分大小写，需使用小写（`pyside6`）。本工具插件列表已使用官方小写名。
+**新特性**
+- Linux / macOS 跨平台适配，自动跳过 Windows 专属 Flag
+- config.json SHA-256 完整性校验 + `.tmp` 原子写入
+- TOCTOU 防御：后台线程二次校验脚本/图标存在性
+- 命令回显脱敏（builder + deps 全覆盖）
 
-**Q：报 `Invalid version number --file-version='V1.0.0'`？**
-A：Windows 版本号必须是数字点分格式。输入框已限制只能输入数字与点，旧配置中的 `V` 前缀会被自动清洗。
+**问题修复**
+- 取消打包硬杀进程树（`taskkill /T /F` / `os.killpg`），修复 scons/gcc 残留
+- 预创建 `NUITKA_CACHE_DIR`，修复 Nuitka 4.2.x `FileNotFoundError`
+- Qt 插件多布局探测（`Qt5/plugins` / `Qt6/plugins` / `PySide6/plugins`）
+- `nuitka>=4.2.1,<4.3.0`，修复 4.1.3 在 Python 3.13 上的 PyQt5 插件检测失败
 
-**Q：Python 3.13 下「下载 MinGW64」按钮？**
-A：Python 3.13+ 不支持 MinGW64，按钮自动变为「安装 MSVC 指引」，请安装 Microsoft C++ Build Tools 后重新运行环境检查。
+### v1.0.0 (2026-09-27)
+
+首个稳定版本。
 
 ## License
 
