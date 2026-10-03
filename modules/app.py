@@ -1066,9 +1066,11 @@ class NuitkaGUI(QMainWindow):
 
     # ---------- 主题 ----------
     def _apply_theme(self, theme):
-        """切换亮色/暗色主题(运行时调用): 重新应用窗口级样式并同步部件。"""
+        """切换亮色/暗色主题: 应用级样式替换 + 局部部件同步。"""
         self.theme = theme
-        self.setStyleSheet(APP_QSS if theme == "light" else APP_DARK_QSS)
+        qss = APP_QSS if theme == "light" else APP_DARK_QSS
+        QApplication.instance().setStyleSheet(qss)
+        self.setStyleSheet(qss)
         self._apply_theme_parts()
 
     def _apply_theme_parts(self):

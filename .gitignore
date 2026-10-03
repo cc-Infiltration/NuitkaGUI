@@ -11,6 +11,7 @@ main.build/
 _nuitka_temp.build/
 nuitka-crash-report.xml
 _inno_install/
+installer/
 _inno/
 is_setup.exe
 *.iss~
