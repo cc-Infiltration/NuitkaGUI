@@ -8,17 +8,39 @@
 - run_mingw_download(): 通过一次极简编译触发 Nuitka 自动下载 MinGW64。
 """
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .builder import resolve_python, run_process, _mask_path_arg
 
 CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 _VERSION_RE = re.compile(r"^\d+(\.\d+)+")
+
+# MSVC 内部版本号 → 发布年份/名称
+# vswhere 的 catalog.productLineVersion 就是内部版本: 18 → 2026, 17 → 2022 等
+_MSVC_NAME_MAP = {
+    "18": "Visual Studio 2026",
+    "17": "Visual Studio 2022",
+    "16": "Visual Studio 2019",
+    "15": "Visual Studio 2017",
+    "14": "Visual Studio 2015",
+}
+
+# MSVC cl.exe 版本号 → MSVC 发布年份 (cl.exe --version 输出)
+# 例如 Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35207 → MSVC 2022
+_CL_VERSION_MAP = [
+    (19, 40, "MSVC 2022+"),   # 19.40+ = VS 2022 v17.8+ / VS 2026
+    (19, 30, "MSVC 2022"),    # 19.30 - 19.39 = VS 2022
+    (19, 20, "MSVC 2019"),    # 19.20 - 19.29 = VS 2019
+    (19, 10, "MSVC 2017"),    # 19.10 - 19.19 = VS 2017
+    (19, 0,  "MSVC 2015"),    # 19.00 = VS 2015
+]
 
 # 常见的 MinGW64 安装位置(部分含版本子目录, 需要浅层探测)
 _MINGW_COMMON = [
@@ -86,74 +108,197 @@ def python_requires_msvc():
     return os.name == "nt" and sys.version_info >= (3, 13)
 
 
-def _find_cl_in(base):
-    """在 MSVC 版本目录下查找最新的 cl.exe (Hostx64/x64)"""
-    if not os.path.isdir(base):
-        return None
+def _annotate_cl(cl_path):
+    """给 cl.exe 查版本号 + 发行名。返回 (path, msc_ver_str, release_name)。"""
+    msc_ver = ""
+    release = "MSVC"
     try:
-        versions = [d for d in os.listdir(base)
-                    if os.path.isdir(os.path.join(base, d))]
-    except OSError:
-        return None
-    for ver in sorted(versions, reverse=True):
-        for sub in ("bin/Hostx64/x64/cl.exe", "bin/cl.exe"):
-            cand = os.path.join(base, ver, *sub.split("/"))
-            if os.path.isfile(cand):
-                return cand
-    return None
+        # cl.exe 在 Windows 上输出系统 OEM 编码 (中文系统是 CP936),
+        # 不用 text=True 自动 UTF-8, 手动用 errors=replace 防止解码崩溃
+        proc = subprocess.run([cl_path], capture_output=True, timeout=5,
+                              creationflags=CREATE_NO_WINDOW)
+        out = (proc.stderr or proc.stdout or b"").decode(
+            "utf-8", errors="replace") + (proc.stdout or b"").decode(
+            "utf-8", errors="replace")
+        m = re.search(r"Version\s+(\d+)\.(\d+)\.(\d+)", out)
+        if m:
+            major, minor = int(m.group(1)), int(m.group(2))
+            msc_ver = f"{major}.{minor}"
+            for cl_maj, cl_min, name in _CL_VERSION_MAP:
+                if (major > cl_maj) or (major == cl_maj and minor >= cl_min):
+                    release = name
+                    break
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return (cl_path, msc_ver, release)
 
 
-def find_msvc():
-    """检测是否安装 MSVC (Visual Studio / Build Tools)
+def _vswhere_json():
+    """调用 vswhere 并解析 JSON, 返回 vs 实例列表。失败返回 []。"""
+    if os.name != "nt":
+        return []
+    # vswhere 的位置: 跟随最新的 VS 安装, 都在 ProgramFiles(x86)
+    pf86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    vswhere = os.path.join(pf86, "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if not os.path.isfile(vswhere):
+        return []
+    try:
+        proc = subprocess.run(
+            [vswhere, "-products", "*",
+             "-format", "json", "-utf8"],
+            capture_output=True, timeout=15,
+            creationflags=CREATE_NO_WINDOW)
+        if proc.returncode != 0 or not proc.stdout:
+            return []
+        data = json.loads(proc.stdout)
+        return data if isinstance(data, list) else []
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return []
 
-    仅 Windows 有效; Linux/macOS 上 Nuitka 用系统 gcc/clang, 直接返回 [].
+
+def find_msvc(extra_dirs=None):
+    """检测所有 MSVC 安装。
+
+    检测顺序:
+      1) vswhere JSON (最权威, 能找到自定义路径安装)
+      2) 硬编码路径 (覆盖老版本 vswhere 扫不到的情况)
+      3) PATH 里的 cl
+      4) 用户传入的 extra_dirs
+
+    两阶段执行:
+      Phase 1 (串行, 快): 收集所有 cl.exe 路径 + 元数据 (display/安装根), 不跑子进程
+      Phase 2 (并行, 慢): 批量跑版本探测 (最多 6 个并发子进程)
+
+    返回 [{"path": cl_path, "version": "19.44", "release": "MSVC 2022",
+           "display": "Visual Studio 2026 (18.10) — D:\\...", "首选": True/False}, ...]
+    按版本降序, 最新的排第一个并标记 "首选"。
     """
     if os.name != "nt":
         return []
-    found = []
+
+    # ---- Phase 1: 收集所有 cl.exe (不跑子进程, 纯 os.path.isfile) ----
+    # 内部 _collect_cl_paths 是 _find_cl_in 的精简版: 只收集路径不跑 _annotate_cl
+    def _collect_cl_paths(base):
+        """纯路径收集: 从 base 下找到 cl.exe, 返回 (cl_path, None, None) 或 None。"""
+        if not base or not os.path.isdir(base):
+            return None
+        try:
+            versions = sorted(
+                [d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))],
+                reverse=True)
+        except OSError:
+            return None
+        for ver in versions:
+            for sub in ("bin/Hostx64/x64/cl.exe", "bin/Hostx64/x86/cl.exe", "bin/cl.exe"):
+                cand = os.path.join(base, ver, *sub.split("/"))
+                if os.path.isfile(cand):
+                    return cand
+        for sub in ("bin/Hostx64/x64/cl.exe", "bin/cl.exe", "cl.exe"):
+            cand = os.path.join(base, *sub.split("/"))
+            if os.path.isfile(cand):
+                return cand
+        return None
+
+    candidates = []  # [(cl_path, display, install_path)]
+    seen_paths = set()
+
+    # 1) vswhere JSON
+    for inst in _vswhere_json():
+        if not inst.get("isComplete"):
+            continue
+        install_path = inst.get("installationPath")
+        if not install_path:
+            continue
+        msvc_tools = os.path.join(install_path, "VC", "Tools", "MSVC")
+        cl_path = _collect_cl_paths(msvc_tools) or _collect_cl_paths(install_path)
+        if not cl_path:
+            continue
+        norm = os.path.normpath(cl_path).lower()
+        if norm in seen_paths:
+            continue
+        seen_paths.add(norm)
+        product_line = inst.get("catalog", {}).get("productLineVersion", "")
+        vs_name = _MSVC_NAME_MAP.get(
+            str(product_line), inst.get("displayName", "Visual Studio"))
+        version_str = inst.get("catalog", {}).get(
+            "productDisplayVersion", inst.get("installationVersion", ""))
+        candidates.append((cl_path, f"{vs_name} ({version_str})", install_path))
+
+    # 2) 硬编码路径兜底
     prog_files = [os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")]
-    # vswhere
     for base in prog_files:
         if not base:
             continue
-        vs = os.path.join(base, "Microsoft Visual Studio", "Installer", "vswhere.exe")
-        if os.path.isfile(vs):
-            try:
-                proc = subprocess.run(
-                    [vs, "-products", "*",
-                     "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                     "-property", "installationPath"],
-                    capture_output=True, text=True, timeout=15,
-                    creationflags=CREATE_NO_WINDOW)
-                for line in (proc.stdout or "").splitlines():
-                    line = line.strip()
-                    if line:
-                        cl = _find_cl_in(os.path.join(line, "VC", "Tools", "MSVC"))
-                        if cl:
-                            found.append(cl)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-    # 常见安装路径
-    base_dir = prog_files[0] or r"C:\Program Files (x86)"
-    for year in ("2019", "2022"):
-        for edition in ("Community", "Professional", "Enterprise", "BuildTools"):
-            cl = _find_cl_in(os.path.join(
-                base_dir, "Microsoft Visual Studio", year, edition,
-                "VC", "Tools", "MSVC"))
-            if cl:
-                found.append(cl)
-    # PATH
-    cl = shutil.which("cl")
-    if cl:
-        found.append(cl)
-    # 去重保序
-    seen = set()
-    uniq = []
-    for p in found:
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return uniq
+        for year in ("2015", "2017", "2019", "2022"):
+            for edition in ("Community", "Professional", "Enterprise", "BuildTools"):
+                msvc_tools = os.path.join(
+                    base, "Microsoft Visual Studio", year, edition,
+                    "VC", "Tools", "MSVC")
+                cl_path = _collect_cl_paths(msvc_tools)
+                if not cl_path:
+                    continue
+                norm = os.path.normpath(cl_path).lower()
+                if norm in seen_paths:
+                    continue
+                seen_paths.add(norm)
+                candidates.append((
+                    cl_path, f"Visual Studio {year} ({edition})",
+                    os.path.dirname(os.path.dirname(msvc_tools))))
+
+    # 3) PATH
+    cl_on_path = shutil.which("cl")
+    if cl_on_path:
+        norm = os.path.normpath(cl_on_path).lower()
+        if norm not in seen_paths:
+            seen_paths.add(norm)
+            candidates.append((cl_on_path, "PATH 中的 cl.exe",
+                               os.path.dirname(os.path.dirname(cl_on_path))))
+
+    # 4) 自定义目录
+    for d in (extra_dirs or []):
+        if not d:
+            continue
+        cl_path = _collect_cl_paths(d)
+        if not cl_path:
+            continue
+        norm = os.path.normpath(cl_path).lower()
+        if norm in seen_paths:
+            continue
+        seen_paths.add(norm)
+        candidates.append((cl_path, f"自定义目录: {d}", d))
+
+    # ---- Phase 2: 批量并行跑版本探测 ----
+    if not candidates:
+        return []
+    all_cl_paths = [c[0] for c in candidates]
+    annot_map = _batch_annotate_cl(all_cl_paths)  # {path: (msc_ver, release)}
+
+    # 组装结果
+    results = []
+    for cl_path, display, install_path in candidates:
+        msc_ver, release = annot_map.get(cl_path, ("", "MSVC"))
+        results.append({
+            "path": cl_path,
+            "version": msc_ver,
+            "release": release,
+            "display": display,
+            "install_path": install_path,
+        })
+
+    # 按版本降序排序
+    def _sort_key(r):
+        try:
+            return tuple(int(x) for x in r["version"].split("."))
+        except (ValueError, AttributeError):
+            return (0, 0)
+    results.sort(key=_sort_key, reverse=True)
+
+    # 标记首选
+    if results:
+        results[0]["preferred"] = True
+        for r in results[1:]:
+            r["preferred"] = False
+    return results
 
 
 def check_nuitka():
@@ -253,8 +398,169 @@ def _probe_compiler_version(cmd_list):
     return _first_line(proc.stdout) if proc else ""
 
 
-def check_compiler():
+def _batch_probe_versions(paths, args=("--version",), timeout=8, max_workers=6):
+    """批量并行跑版本探测, 返回 {path: version_str} 字典。
+
+    最多 max_workers 个并行子进程, 防止系统里装了 10 个编译器时同时起 10 个进程。
+    """
+    results = {}
+    if not paths:
+        return results
+    workers = min(max_workers, len(paths))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_probe, [p] + list(args), timeout=timeout): p
+                   for p in paths}
+        for fut in as_completed(futures):
+            p = futures[fut]
+            proc = fut.result()
+            ver = _first_line(proc.stdout) if proc else ""
+            results[p] = ver
+    return results
+
+
+def _batch_annotate_cl(cl_paths, max_workers=6):
+    """批量并行探测 cl.exe 版本, 返回 {path: (msc_ver_str, release_name)}。"""
+    results = {}
+    if not cl_paths:
+        return results
+    workers = min(max_workers, len(cl_paths))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_annotate_cl, p): p for p in cl_paths}
+        for fut in as_completed(futures):
+            path = futures[fut]
+            try:
+                _p, msc_ver, release = fut.result()
+                results[path] = (msc_ver, release)
+            except Exception:
+                results[path] = ("", "MSVC")
+    return results
+
+
+def _find_all_gcc_windows():
+    """Windows 上尽可能多地找到 gcc.exe / MinGW64。
+
+    两阶段执行:
+      Phase 1 (串行, 快): 收集所有 gcc.exe 路径 (os.path.isfile + registry, 无子进程)
+      Phase 2 (并行, 慢): 批量跑 gcc --version (最多 6 个并发)
+
+    扫描来源: PATH / Nuitka 缓存 / _MINGW_COMMON / 注册表 Uninstall。
+    返回 [{"path": ..., "source": "PATH|Nuitka缓存|...", "version": "...",
+           "distro": "MinGW64|MSYS2|TDM-GCC|..."}, ...] 按版本降序。
+    """
+    # ---- Phase 1: 收集所有 gcc.exe (纯文件系统, 不跑子进程) ----
+    candidates = []  # [(gcc_path, source, distro_hint)]
+    seen_paths = set()
+
+    def _collect(path, source, distro_hint=""):
+        if not path or not os.path.isfile(path):
+            return
+        norm = os.path.normpath(path).lower()
+        if norm in seen_paths:
+            return
+        seen_paths.add(norm)
+        candidates.append((path, source, distro_hint))
+
+    # 1) PATH
+    for g in ("gcc", "x86_64-w64-mingw32-gcc"):
+        p = shutil.which(g)
+        if p:
+            _collect(p, "PATH")
+
+    # 2) Nuitka 下载缓存
+    for p in _find_mingw_in_cache():
+        _collect(p, "Nuitka 缓存")
+
+    # 3) _MINGW_COMMON
+    for p in _find_mingw_common():
+        _collect(p, "常见安装位置")
+
+    # 4) 注册表 Uninstall
+    try:
+        import winreg
+        for hive, view in [(winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+                           (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY),
+                           (winreg.HKEY_CURRENT_USER, 0)]:
+            try:
+                k = winreg.OpenKey(hive, r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+                                   access=winreg.KEY_READ | view)
+            except OSError:
+                continue
+            try:
+                i = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(k, i)
+                        i += 1
+                    except OSError:
+                        break
+                    sub_low = sub.lower()
+                    if not any(k in sub_low for k in ("mingw", "msys", "tdm", "gcc")):
+                        continue
+                    try:
+                        sk = winreg.OpenKey(k, sub)
+                        install_loc, _ = winreg.QueryValueEx(sk, "InstallLocation")
+                        winreg.CloseKey(sk)
+                        gcc_cand = os.path.join(install_loc, "mingw64", "bin", "gcc.exe")
+                        if os.path.isfile(gcc_cand):
+                            _collect(gcc_cand, f"注册表: {sub}")
+                    except (OSError, FileNotFoundError):
+                        pass
+                winreg.CloseKey(k)
+            except OSError:
+                pass
+    except ImportError:
+        pass
+
+    # ---- Phase 2: 批量并行跑版本探测 ----
+    if not candidates:
+        return []
+    all_paths = [c[0] for c in candidates]
+    ver_map = _batch_probe_versions(all_paths, args=("--version",), max_workers=6)
+
+    # 推断发行版
+    def _guess_distro(path, hint=""):
+        if hint:
+            return hint
+        low = path.lower()
+        if "msys64" in low or "msys2" in low:
+            return "MSYS2 MinGW64"
+        if "tdm" in low:
+            return "TDM-GCC"
+        if "mingw64" in low:
+            return "MinGW64"
+        if "mingw" in low:
+            return "MinGW"
+        if "mingw-w64" in low:
+            return "MinGW-w64"
+        return "MinGW64"
+
+    results = []
+    for gcc_path, source, distro_hint in candidates:
+        ver = _first_line(ver_map.get(gcc_path, ""))
+        results.append({
+            "path": gcc_path,
+            "source": source,
+            "version": ver,
+            "distro": _guess_distro(gcc_path, distro_hint),
+        })
+
+    # 按版本降序
+    def _sort_key(r):
+        m = _VERSION_RE.search(r.get("version", ""))
+        if m:
+            try:
+                return tuple(int(x) for x in m.group(0).split("."))
+            except ValueError:
+                pass
+        return (0,)
+    results.sort(key=_sort_key, reverse=True)
+    return results
+
+
+def check_compiler(extra_dirs=None):
     """检测 C 编译器。
+
+    extra_dirs: 用户手动指定的编译器搜索目录列表。
 
     返回 (是否可用, [(名称, 状态, 详情, 修复建议), ...])。
 
@@ -266,16 +572,20 @@ def check_compiler():
 
     # --- Linux / macOS 分支 ---
     if os.name != "nt":
-        # gcc
-        gcc = shutil.which("gcc")
-        if gcc:
-            ver = _probe_compiler_version([gcc, "--version"])
-            results.append(("系统 gcc", "ok", "%s (%s)" % (gcc, ver or "版本未知"), ""))
-            ok = True
-        else:
+        # gcc (可能多版本, 通过不同后缀区分)
+        gcc_any = False
+        for suffix in ("", "-14", "-13", "-12", "-11", "-10", "-9"):
+            gcc = shutil.which("gcc" + suffix)
+            if gcc:
+                ver = _probe_compiler_version([gcc, "--version"])
+                label = "系统 gcc" + (suffix if suffix else "")
+                results.append((label, "ok", "%s (%s)" % (gcc, ver or "版本未知"), ""))
+                ok = True
+                gcc_any = True
+        if not gcc_any:
             results.append(("系统 gcc", "error", "未检测到", GCC_LINUX_HINT))
 
-        # clang (gcc 的替代品, 并列列出)
+        # clang
         clang = shutil.which("clang")
         if clang:
             ver = _probe_compiler_version([clang, "--version"])
@@ -289,30 +599,49 @@ def check_compiler():
     # --- Windows 分支 ---
     msvc_required = python_requires_msvc()
 
-    gcc = shutil.which("gcc")
-    if gcc:
-        ver = _probe_compiler_version([gcc, "--version"])
-        results.append(("系统 gcc", "ok", "%s (%s)" % (gcc, ver or "版本未知"), ""))
-        ok = True
-    else:
-        results.append(("系统 gcc", "warn", "未加入 PATH (可选, 不强制)", ""))
-
-    msvc = find_msvc()
-    if msvc:
-        results.append(("MSVC", "ok", msvc[0], ""))
-        ok = True
+    # MSVC (多版本)
+    msvc_list = find_msvc(extra_dirs=extra_dirs)
+    if msvc_list:
+        for i, m in enumerate(msvc_list):
+            tag = " ★首选" if m.get("preferred") else ""
+            detail = f"{m['display']}{tag}\n  cl: {m['path']}"
+            if m["version"]:
+                detail += f"\n  编译器版本: cl {m['version']}"
+            status = "ok"
+            results.append(("MSVC", status, detail, ""))
+            ok = True
     else:
         results.append(("MSVC", "error" if msvc_required else "warn",
                         "未检测到", MSVC_HINT if msvc_required else ""))
 
+    # GCC/MinGW (多版本) — 仅在 Python < 3.13 下有意义
     if msvc_required:
-        # Python 3.13+ 下不检测 MinGW64 (Nuitka 不支持), 避免出现多余提示
         pass
     else:
-        mingw_paths = _find_mingw_in_cache() + _find_mingw_common()
-        if mingw_paths:
-            results.append(("MinGW64", "ok", mingw_paths[0], ""))
-            ok = True
+        gcc_list = _find_all_gcc_windows()
+        # 也搜用户 extra_dirs 里的 gcc
+        for d in (extra_dirs or []):
+            if not d:
+                continue
+            for sub in ("gcc.exe", "bin/gcc.exe", "mingw64/bin/gcc.exe"):
+                cand = os.path.join(d, *sub.split("/"))
+                if os.path.isfile(cand) and not any(
+                        os.path.normpath(r["path"]) == os.path.normpath(cand)
+                        for r in gcc_list):
+                    gcc_list.append({
+                        "path": cand, "source": f"自定义目录: {d}",
+                        "version": _first_line(
+                            _probe_compiler_version([cand, "--version"])),
+                        "distro": "MinGW64",
+                    })
+        if gcc_list:
+            for i, g in enumerate(gcc_list):
+                tag = "" if i > 0 else " (首选)"
+                ver_info = f", {g['version'][:60]}" if g["version"] else ""
+                results.append((
+                    f"{g['distro']}{tag}", "ok",
+                    f"{g['path']}{ver_info}\n  来源: {g['source']}", ""))
+                ok = True
         else:
             results.append(("MinGW64", "error", "未找到; 首次打包时 Nuitka 会自动下载",
                             "点击「下载 MinGW64」预下载, 或直接开始打包(已自动确认下载)"))
@@ -320,8 +649,10 @@ def check_compiler():
     return ok, results
 
 
-def run_env_check():
+def run_env_check(extra_dirs=None):
     """完整环境检查。
+
+    extra_dirs: 用户手动指定的编译器搜索目录列表 (如 config['custom_compiler_dirs'])。
 
     返回 [(名称, 状态, 详情, 修复建议), ...]。状态: ok / warn / error。
     整体通过 = 不包含 error 项。
@@ -343,7 +674,7 @@ def run_env_check():
         items.append(("Nuitka", "error", "未检测到",
                       "请安装: pip install nuitka (官方源: pip install nuitka)"))
 
-    ok_c, compiler_results = check_compiler()
+    ok_c, compiler_results = check_compiler(extra_dirs=extra_dirs)
     for name, status, detail, hint in compiler_results:
         items.append((name, status, detail, hint))
 

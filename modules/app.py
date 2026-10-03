@@ -239,6 +239,34 @@ TAB_SPECS = (
 
 
 
+# 行级别智能分级: stdout 行若含错误/警告关键词, 自动提升日志级别
+# 这些关键词必须在 stderr 缺失时能精准定位问题 (Nuitka 多数 FATAL 也会走 stderr,
+# 但历史上 PyQt5 插件检测 FATAL 就曾打到 stdout)
+_LOG_LEVEL_HINTS = [
+    # (小写子串, 要提升的 level)
+    ("fatal", "error"),
+    ("traceback", "error"),
+    ("exception", "error"),
+    ("error:", "error"),
+    ("error c", "error"),    # MSVC C 编译器错误
+    ("  error ", "error"),   # Nuitka 模块内的 ERROR 标记
+    ("warning:", "warn"),
+    ("  warning ", "warn"),
+]
+
+
+def _classify_line_level(line):
+    """根据内容判断 stdout 行的建议日志级别。
+
+    默认 normal; 匹配到 FATAL/ERROR 关键词 → error, 匹配到 WARNING → warn。
+    """
+    low = (line or "").lower()
+    for hint, level in _LOG_LEVEL_HINTS:
+        if hint in low:
+            return level
+    return "normal"
+
+
 class WorkerQueue:
     """把 builder/deps 的 log_queue.put(item) 转发为 Qt 信号(跨线程安全)。"""
 
@@ -1104,14 +1132,33 @@ class NuitkaGUI(QMainWindow):
         self.log_text.setTextCursor(cursor)
         self.log_text.ensureCursorVisible()
 
+    def _jump_to_first_error(self):
+        """在日志里选中并跳转到第一条 FATAL/ERROR 行, 帮助用户快速定位错误。"""
+        doc = self.log_text.document()
+        keywords = ("fatal", "traceback", "error:", "  error ", "exception")
+        for i in range(doc.blockCount()):
+            text = doc.block(i).text().lower()
+            if any(k in text for k in keywords):
+                cursor = QTextCursor(doc)
+                cursor.movePosition(QTextCursor.MoveOperation.Start)
+                for _ in range(i):
+                    cursor.movePosition(QTextCursor.MoveOperation.Down)
+                cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+                self.log_text.setTextCursor(cursor)
+                self.log_text.ensureCursorVisible()
+                return
+
     def _clear_log(self):
         self.log_text.clear()
 
     def _preview_command(self):
-        cmd = build_command(self._collect_config())
+        cmd, blocked = build_command(self._collect_config())
         if not cmd:
             self._log("找不到可用的 Python 解释器(需已安装 Nuitka)", "error")
             return
+        if blocked:
+            self._log("已忽略 UI 已管控的高级参数: %s (请使用表单对应字段)"
+                      % ", ".join(blocked), "warn")
         self._log("========== 命令预览 ==========", "cmd")
         self._log(" ".join(cmd), "cmd")
         self._log("(仅预览, 未执行; 执行完整构建请点击「开始打包」)", "cmd")
@@ -1248,7 +1295,9 @@ class NuitkaGUI(QMainWindow):
             self.progress.setRunning(False)
 
     def _on_output(self, line):
-        self._log(line)
+        # 行级别智能分级: stdout 里的 FATAL/ERROR/WARNING 自动上色
+        level = _classify_line_level(line)
+        self._log(line, level)
         low = line.lower()
 
         # --- C 编译真实进度: 从 Nuitka 输出统计模块总数与已完成数 ---
@@ -1307,6 +1356,8 @@ class NuitkaGUI(QMainWindow):
             self._set_status_color("#FF3B30")
             self.lbl_status.setText("打包失败")
             self._log("========== 打包失败 (退出码 %s) ==========" % code, "error")
+            # 自动跳转到日志第一条 FATAL/ERROR 行, 帮助快速定位
+            self._jump_to_first_error()
             # 从日志中自动诊断失败原因, 给出针对性提示
             findings = analyze_failure(self.log_text.toPlainText())
             if (deps.python_requires_msvc() and not deps.find_msvc()

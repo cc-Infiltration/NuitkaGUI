@@ -16,6 +16,31 @@ import threading
 
 _VERSION_RE = re.compile(r"[vV]?\s*(\d+(?:\.\d+)*)")
 
+# extra_args 黑名单: UI 已有对应表单控件、不允许被高级参数覆盖的 flag
+# Nuitka 对重复 flag 取最后一个, extra_args 在命令行末尾会覆盖 builder 构造的值
+# 过滤规则: 以 --foo 开头的都拦截 (--foo=bar 和 --foo bar 两种形式)
+_EXTRA_ARGS_BLOCKLIST = frozenset([
+    # 输出与模式 (L127-138)
+    "--standalone", "--onefile", "--module",
+    "--output-dir", "--output-filename",
+    # 控制台 (L139-144)
+    "--enable-console", "--windows-console-mode",
+    # 图标 (L147-152)
+    "--windows-icon-from-ico",
+    # 插件 (L154-155)
+    "--enable-plugin", "--disable-plugin",
+    # LTO / jobs / 自动下载 / 清理 (L157-173)
+    "--lto", "--jobs", "--assume-yes-for-downloads", "--remove-output",
+    # 数据包含 (L175-178) — 防止绕过 UI 直接包含敏感系统目录
+    "--include-data-dir", "--include-data-files",
+    # 模块包含/排除 (L179-184)
+    "--include-package", "--include-module", "--nofollow-import-to",
+    # Windows 元数据 (L185-201)
+    "--company-name", "--product-name",
+    "--file-version", "--product-version",
+    "--file-description", "--copyright",
+])
+
 # 可运行 `python -m nuitka` 的解释器路径(解析后缓存)
 _PYTHON_EXE = None
 
@@ -117,11 +142,49 @@ def _split_extra(text):
         return text.split()
 
 
+def _filter_extra_args(args):
+    """从 extra_args 里剔除 UI 已管控的 flag, 防止覆盖 UI 构造的命令行。
+
+    支持两种 Nuitka flag 形式:
+      1) --flag=value     单参数 (flag 和 value 在同一个 str 里)
+      2) --flag value     双参数 (flag 单独一个 str, value 在下一个)
+
+    返回: (filtered_args, blocked_flags) — 保留的参数列表 + 被拦截的 flag 名列表
+    """
+    if not args:
+        return [], []
+    filtered = []
+    blocked = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        # 提取 flag 名: 去 -- 前缀, 取 = 前的部分
+        if arg.startswith("--"):
+            flag_name = arg.split("=", 1)[0]
+            if flag_name in _EXTRA_ARGS_BLOCKLIST:
+                blocked.append(flag_name)
+                # 如果是 --flag value 形式 (flag 单独一个 str, value 在下一个)
+                # 且下一个参数不以 -- 开头, 跳过 value
+                if "=" not in arg and i + 1 < len(args) and not args[i + 1].startswith("--"):
+                    i += 2
+                    continue
+                i += 1
+                continue
+        filtered.append(arg)
+        i += 1
+    return filtered, blocked
+
+
 def build_command(cfg):
-    """根据配置字典构造 Nuitka 命令行参数列表; 找不到可用解释器时返回 []"""
+    """根据配置字典构造 Nuitka 命令行参数列表。
+
+    返回: (cmd, blocked_flags)
+      cmd: 构造好的命令行参数列表; 找不到可用解释器时返回 ([], [])
+      blocked_flags: extra_args 里被拦截的 flag 名列表 (UI 已管控, 不允许覆盖)
+    """
     python = resolve_python()
     if not python:
-        return []
+        return [], []
     cmd = [python, "-m", "nuitka"]
 
     mode = cfg.get("mode", "onefile")
@@ -200,7 +263,10 @@ def build_command(cfg):
             if val:
                 cmd.append("%s=%s" % (flag, val))
 
-    cmd.extend(_split_extra(cfg.get("extra_args") or ""))
+    # extra_args: 先拆再过滤 UI 已管控的 flag, 防止覆盖 builder 构造的值
+    raw_extra = _split_extra(cfg.get("extra_args") or "")
+    filtered_extra, blocked_flags = _filter_extra_args(raw_extra)
+    cmd.extend(filtered_extra)
 
     script = (cfg.get("script") or "").strip()
     if script:
@@ -212,7 +278,7 @@ def build_command(cfg):
             cmd.append("--include-data-files=%s=styles/" %
                        os.path.join(style_dir, "*.qss"))
         cmd.append(script)
-    return cmd
+    return cmd, blocked_flags
 
 
 def _detect_qt_plugin_dirs(python_exe):
@@ -335,12 +401,16 @@ def run_build(log_queue, stop_event, cfg):
         log_queue.put(("done", -1))
         return
 
-    cmd = build_command(cfg)
+    cmd, blocked_flags = build_command(cfg)
     if not cmd:
         log_queue.put(("error", "找不到可用的 Python 解释器(需已安装 Nuitka)。"
                                "请安装 Python 后执行: pip install nuitka"))
         log_queue.put(("done", -1))
         return
+    if blocked_flags:
+        log_queue.put(("warn",
+                       "已忽略 UI 已管控的高级参数: %s (请使用表单对应字段)"
+                       % ", ".join(blocked_flags)))
     # 回显脱敏: 去掉 PowerShell 前缀, 路径只显示 basename, 防止日志泄露项目位置
     masked_cmd = " ".join(_mask_path_arg(a) for a in cmd)
     log_queue.put(("cmd", masked_cmd))
@@ -390,6 +460,9 @@ def run_process(cmd, cwd, log_queue, stop_event, cfg=None):
     """启动子进程, 逐行输出日志到 log_queue, 支持通过 stop_event 取消
 
     返回退出码: 0 成功, -1 启动失败, -2 用户取消
+
+    stdout 行 → ("line", text)   — 普通输出 (Nuitka INFO 级)
+    stderr 行 → ("error", text)  — 错误/警告 (Nuitka FATAL/WARNING 级)
     """
     try:
         creationflags = subprocess.CREATE_NO_WINDOW
@@ -400,7 +473,7 @@ def run_process(cmd, cwd, log_queue, stop_event, cfg=None):
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
             creationflags=creationflags if os.name == "nt" else 0,
@@ -412,17 +485,23 @@ def run_process(cmd, cwd, log_queue, stop_event, cfg=None):
         log_queue.put(("error", "无法启动命令: %s" % exc))
         return -1
 
-    def pump():
+    def _pump(pipe, kind):
+        """通用行流读取: kind='line' 走 stdout (普通输出), kind='error' 走 stderr (错误)"""
         try:
-            for line in proc.stdout:
-                log_queue.put(("line", line.rstrip("\n")))
+            for line in pipe:
+                stripped = line.rstrip("\n")
+                if stripped:
+                    log_queue.put((kind, stripped))
         except (ValueError, OSError):
-            # stdout.close() 后迭代器会抛 ValueError / OSError, 忽略
+            # pipe.close() 后迭代器抛 ValueError / OSError, 忽略
             pass
         except Exception:
             pass
 
-    threading.Thread(target=pump, daemon=True).start()
+    threading.Thread(target=_pump, args=(proc.stdout, "line"),
+                     daemon=True).start()
+    threading.Thread(target=_pump, args=(proc.stderr, "error"),
+                     daemon=True).start()
 
     while proc.poll() is None:
         if stop_event.wait(0.2):

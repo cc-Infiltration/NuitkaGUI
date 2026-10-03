@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     "copyright": "",
     "extra_args": "",
     "theme": "light",            # light / dark
+    "custom_compiler_dirs": [],  # 用户手动指定的编译器搜索目录 (自定义 VS/MinGW 安装路径)
 }
 
 
