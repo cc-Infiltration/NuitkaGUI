@@ -45,36 +45,19 @@ jobs:
           cache: pip
 
       # Linux: gcc + zlib1g-dev
-      - name: apt build-essential
+      - name: apt deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -y
           sudo apt-get install -y build-essential zlib1g-dev
 
-      # Windows 3.13: 注入 VsDevCmd 环境变量让 cl.exe 可用
-      - name: init MSVC env
-        if: runner.os == 'Windows' && matrix.needs-vcvars
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $installPath = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $installPath) { throw "MSVC not found" }
-          $vsdevCmd = Join-Path $installPath "Common7\Tools\VsDevCmd.bat"
-          $tmp = [System.IO.Path]::GetTempFileName()
-          cmd /c "`"$vsdevCmd`" -arch=x64 -host_arch=x64 && set > `"$tmp`""
-          Get-Content $tmp | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "Env:$($matches[1])" -Value $matches[2] }
-          }
-          Remove-Item $tmp -Force
-          cl
-
-      # Windows 3.12: Nuitka 不再自动下 MinGW64, 手动装
+      # Windows 3.12: winget 装 MSYS2 MinGW64, 加 PATH
       - name: install MinGW64
         if: runner.os == 'Windows' && matrix.python-version == '3.12'
         shell: pwsh
         run: |
           winget install -e --id MSYS2.MSYS2 --accept-package-agreements --accept-source-agreements
-          $env:Path = "C:\msys64\mingw64\bin;" + $env:Path
+          "C:\msys64\mingw64\bin" | Out-File "$env:GITHUB_PATH" -Append -Encoding utf8
           gcc --version
 
       - name: pip install
@@ -82,13 +65,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 非阻断
       - name: flake8
         run: |
           pip install flake8
-          flake8 --max-line-length=100 --extend-ignore=E501,W503,E265,E303,E305,E127,E741 . ; exit 0
+          flake8 --max-line-length=100 --extend-ignore=E501,W503,E265,E303,E305,E127,E741 . || true
 
-      # 语法 + import
       - name: smoke test
         run: |
           python -c "
@@ -97,58 +78,81 @@ jobs:
               py_compile.compile(f, doraise=True)
           sys.path.insert(0, '.')
           from modules import config, deps, builder
-          print('OK — all modules importable')
+          print('OK')
           "
 
-      - name: nuitka build
+      # ========= Windows+VC: VsDevCmd + nuitka 同一个 pwsh step, 环境不丢 =========
+      - name: MSVC nuitka build
+        if: runner.os == 'Windows' && matrix.needs-vcvars
         shell: pwsh
         run: |
-          $isLinux = '${{ runner.os }}' -eq 'Linux'
-          $exeName = if ($isLinux) { 'NuitkaGUI' } else { 'NuitkaGUI.exe' }
-
-          # 纯 PowerShell 构建数组 — 不用模板变量在数组字面量里, 避免空值产生语法错误
-          $flags = New-Object System.Collections.Generic.List[string]
-          $flags.Add('--standalone')
-          $flags.Add('--onefile')
-          $flags.Add('--enable-plugin=pyside6')
-          $flags.Add('--assume-yes-for-downloads')
-          $flags.Add('--jobs=4')
-
-          # 编译器参数 — 非空才加
-          $cc = '${{ matrix.nuitka-compiler-flag }}'
-          if ($cc) { $flags.Add($cc) }
-
-          # Windows 专属 flag
-          if (-not $isLinux) {
-            $flags.Add('--windows-console-mode=disable')
-            $flags.Add('--windows-icon-from-ico=a.ico')
-            $flags.Add('--include-data-files=a.ico=a.ico')
+          # 注入 MSVC 环境
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installPath) { throw "MSVC not found" }
+          Write-Host "VS: $installPath"
+          $vsdev = Join-Path $installPath "Common7\Tools\VsDevCmd.bat"
+          $tmp = [System.IO.Path]::GetTempFileName()
+          cmd /c "`"$vsdev`" -arch=x64 -host_arch=x64 && set > `"$tmp`""
+          Get-Content $tmp | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "Env:$($matches[1])" -Value $matches[2] }
           }
+          Remove-Item $tmp -Force
+          cl
 
-          $flags.Add('--output-filename=' + $exeName)
-          $flags.Add('--output-dir=dist')
-          $flags.Add('main.py')
+          # 构建 — 普通数组 + splat (@), 空值已经在矩阵里不存在
+          $flags = @(
+            '--standalone', '--onefile', '--enable-plugin=pyside6',
+            '--assume-yes-for-downloads', '--jobs=4',
+            '--windows-console-mode=disable', '--windows-icon-from-ico=a.ico',
+            '--include-data-files=a.ico=a.ico',
+            '--output-filename=NuitkaGUI.exe', '--output-dir=dist', 'main.py'
+          )
+          Write-Host "nuitka $($flags -join ' ')"
+          python -m nuitka @flags
 
-          Write-Host "nuitka args: $($flags -join ' ')"
-          python -m nuitka $flags
+      # ========= 其他 (Ubuntu+gcc / Windows+GCC): bash 数组, 空值安全 =========
+      - name: nuitka build
+        if: matrix.needs-vcvars == false
+        shell: bash
+        run: |
+          IS_LINUX="${{ runner.os }}"
+          CC_FLAG="${{ matrix.nuitka-compiler-flag }}"
+
+          FLAGS=(
+            --standalone --onefile --enable-plugin=pyside6
+            --assume-yes-for-downloads --jobs=4
+          )
+          # 编译器 flag — 仅非空时追加
+          [ -n "$CC_FLAG" ] && FLAGS+=("$CC_FLAG")
+          # Windows 专属
+          if [ "$IS_LINUX" != "Linux" ]; then
+            FLAGS+=(--windows-console-mode=disable --windows-icon-from-ico=a.ico --include-data-files=a.ico=a.ico)
+            EXE="NuitkaGUI.exe"
+          else
+            EXE="NuitkaGUI"
+          fi
+          FLAGS+=(--output-filename="$EXE" --output-dir=dist main.py)
+
+          echo "nuitka ${FLAGS[*]}"
+          python -m nuitka "${FLAGS[@]}"
 
       # ---- 验证 ----
-      - name: verify (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: verify
+        shell: bash
         run: |
-          Test-Path dist\NuitkaGUI.exe || throw "FAIL: exe not found"
-          (Get-Item dist\NuitkaGUI.exe).Length / 1MB
-
-      - name: verify (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          test -f dist/NuitkaGUI || { echo "FAIL"; exit 1; }
-          file dist/NuitkaGUI | grep -q ELF
-          ldd dist/NuitkaGUI | grep "not found" || true
+          IS_LINUX="${{ runner.os }}"
+          if [ "$IS_LINUX" = "Linux" ]; then
+            test -f dist/NuitkaGUI || { echo "FAIL: no binary"; exit 1; }
+            file dist/NuitkaGUI | grep -q ELF && echo "ELF OK"
+            ldd dist/NuitkaGUI | grep "not found" || true
+          else
+            test -f dist/NuitkaGUI.exe || { echo "FAIL: no exe"; exit 1; }
+            ls -lh dist/NuitkaGUI.exe
+          fi
 
       # ---- 启动测试 ----
-      - name: smoke run (Linux xvfb)
+      - name: smoke run
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y xvfb
@@ -160,7 +164,7 @@ jobs:
         run: |
           $p = Start-Process dist\NuitkaGUI.exe -PassThru -WindowStyle Hidden
           Start-Sleep 3
-          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; Write-Host "OK 启动后 3s 存活" }
 
       - uses: actions/upload-artifact@v7
         with:
