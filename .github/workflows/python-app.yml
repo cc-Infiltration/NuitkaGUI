@@ -103,9 +103,21 @@ jobs:
       - name: nuitka build
         shell: pwsh
         run: |
-          $exeName = if ('${{ runner.os }}' -eq 'Linux') { 'NuitkaGUI' } else { 'NuitkaGUI.exe' }
-          $winFlags = if ('${{ runner.os }}' -eq 'Linux') { '' } else { '--windows-console-mode=disable --windows-icon-from-ico=a.ico --include-data-files=a.ico=a.ico' }
-          python -m nuitka --standalone --onefile --enable-plugin=pyside6 --assume-yes-for-downloads --jobs=4 ${{ matrix.nuitka-compiler-flag }} $winFlags --output-filename=$exeName --output-dir=dist main.py
+          $isLinux = '${{ runner.os }}' -eq 'Linux'
+          $exeName = if ($isLinux) { 'NuitkaGUI' } else { 'NuitkaGUI.exe' }
+
+          # 用数组 splat, 空字符串会被 Where-Object 过滤掉, 不会变成 Nuitka 的空参数
+          $flags = @(
+            '--standalone', '--onefile', '--enable-plugin=pyside6',
+            '--assume-yes-for-downloads', '--jobs=4',
+            ${{ matrix.nuitka-compiler-flag }},
+            $(if ($isLinux) { '' } else { '--windows-console-mode=disable --windows-icon-from-ico=a.ico --include-data-files=a.ico=a.ico' }),
+            '--output-filename=' + $exeName,
+            '--output-dir=dist',
+            'main.py'
+          ) | Where-Object { $_ -ne '' }
+
+          python -m nuitka @flags
 
       # ---- 验证 ----
       - name: verify (Windows)
