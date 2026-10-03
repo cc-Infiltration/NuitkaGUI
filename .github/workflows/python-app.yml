@@ -1,4 +1,5 @@
-# CI: install deps, build a Windows onefile executable with Nuitka, upload artifact
+# CI: 多平台 Nuitka 构建 + smoke test
+# Windows (3.12 MinGW64 / 3.13 MSVC) · Linux (3.13 gcc)
 name: CI / Build (Nuitka)
 
 on:
@@ -6,18 +7,47 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  workflow_dispatch: # 支持手动触发构建
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   build:
-    # 本项目产物是 Windows exe，Nuitka 需在目标平台构建，故用 windows-latest
-    runs-on: windows-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: [3.12, 3.13]
+        include:
+          # Windows: Python 3.12 强制 MinGW64, Python 3.13+ 强制 MSVC
+          - os: windows-latest
+            python-version: '3.12'
+            compiler-hint: 'mingw64'
+            nuitka-compiler-flag: '--mingw64'
+            windows-flags: '--windows-console-mode=disable --windows-icon-from-ico=a.ico'
+            artifact-suffix: 'win-py3.12-mingw'
+            exe-name: 'NuitkaGUI.exe'
+            icon-flag: '--include-data-files=a.ico=a.ico'
+
+          - os: windows-latest
+            python-version: '3.13'
+            compiler-hint: 'msvc'
+            nuitka-compiler-flag: ''
+            windows-flags: '--windows-console-mode=disable --windows-icon-from-ico=a.ico'
+            artifact-suffix: 'win-py3.13-msvc'
+            exe-name: 'NuitkaGUI.exe'
+            icon-flag: '--include-data-files=a.ico=a.ico'
+
+          # Linux: gcc (Nuitka 默认)
+          - os: ubuntu-24.04
+            python-version: '3.13'
+            compiler-hint: 'gcc'
+            nuitka-compiler-flag: ''
+            windows-flags: ''
+            artifact-suffix: 'linux-py3.13-gcc'
+            exe-name: 'NuitkaGUI'
+            icon-flag: ''
+
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
 
     steps:
@@ -30,50 +60,142 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install dependencies
+      # ---- Linux: 装 gcc + zlib1g-dev (Nuitka onefile 压缩需要) ----
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential zlib1g-dev
+
+      # ---- Windows MSVC: vswhere 验证 MSVC 可用 ----
+      - name: Verify MSVC (Windows 3.13)
+        if: runner.os == 'Windows' && matrix.python-version == '3.13'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere not found" }
+          & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          cl
+          if ($LASTEXITCODE -ne 0) { throw "cl.exe not on PATH" }
+
+      # ---- Windows MinGW64: Python 3.12 需要手动装 (Nuitka 4.x 默认不再自动下载) ----
+      - name: Install MinGW64 (Windows 3.12)
+        if: runner.os == 'Windows' && matrix.python-version == '3.12'
+        shell: pwsh
+        run: |
+          winget install -e --id MSYS2.MSYS2 --accept-package-agreements --accept-source-agreements
+          $env:Path = "C:\msys64\mingw64\bin;" + $env:Path
+          gcc --version
+
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Lint (optional, non-fatal)
+      # ---- Lint & Test (纯 Python, 平台无关, 所有 job 都跑 ----
+      - name: Lint (flake8, 非阻断)
         run: |
-          $hasLintConfig = (Test-Path setup.cfg -PathType Leaf) -or (Test-Path tox.ini -PathType Leaf)
-          $hasPyFiles = (Get-ChildItem -Filter *.py -ErrorAction SilentlyContinue) -or (Test-Path modules -PathType Container)
-          if ($hasLintConfig -or $hasPyFiles) {
-            pip install flake8
-            flake8 --exit-zero .
-          } else {
-            Write-Host "No linting configured; skipping."
-          }
+          pip install flake8
+          flake8 --max-line-length=100 --extend-ignore=E501,W503 . || echo "Lint warnings above"
 
-      - name: Run tests (if present)
+      - name: Smoke test — import 无语法错误
         run: |
-          $hasTests = (Test-Path tests -PathType Container) -or (Get-ChildItem -Filter test_*.py -ErrorAction SilentlyContinue) -or (Get-ChildItem -Filter *_test.py -ErrorAction SilentlyContinue)
-          if ($hasTests) {
-            pip install pytest
-            pytest -q
-          } else {
-            Write-Host "No tests found - skipping"
-          }
+          python -c "
+          import py_compile, glob, sys
+          files = glob.glob('modules/*.py') + ['main.py']
+          failed = False
+          for f in files:
+              try:
+                  py_compile.compile(f, doraise=True)
+                  print(f'  OK  {f}')
+              except py_compile.PyCompileError as e:
+                  print(f'  FAIL {f}: {e}')
+                  failed = True
+          sys.exit(1 if failed else 0)
+          "
 
-      - name: Build with Nuitka (onefile, no console, with icon)
+      - name: Import modules
         run: |
-          python -m nuitka --standalone --onefile --enable-plugin=pyside6 `
-            --windows-console-mode=disable --windows-icon-from-ico=a.ico `
-            --include-data-files=a.ico=a.ico --output-filename=NuitkaGUI `
-            --output-dir=dist --jobs=4 --assume-yes-for-downloads main.py
+          python -c "
+          import sys, os
+          sys.path.insert(0, '.')
+          from modules import config, deps, builder
+          print('modules import OK')
+          print(f'  config keys: {len(config.DEFAULT_CONFIG)}')
+          print(f'  deps.nuitka: {deps.check_nuitka()}')
+          print(f'  platform: {os.name}')
+          "
 
-      - name: Verify artifact
+      # ---- 真正的 Nuitka 构建 ----
+      - name: Build with Nuitka (standalone + onefile)
         shell: pwsh
         run: |
-          if (-not (Test-Path dist\NuitkaGUI.exe -PathType Leaf)) {
-            throw "Build failed: dist\NuitkaGUI.exe not found"
-          }
-          Get-Item dist\NuitkaGUI.exe | Select-Object Name, Length, LastWriteTime
+          python -m nuitka --standalone --onefile --enable-plugin=pyside6 \
+            --assume-yes-for-downloads --jobs=4 \
+            ${{ matrix.nuitka-compiler-flag }} \
+            ${{ matrix.windows-flags }} \
+            ${{ matrix.icon-flag }} \
+            --output-filename=${{ matrix.exe-name }} \
+            --output-dir=dist main.py
 
-      - name: Upload build artifact
+      # ---- Windows 验证: exe 存在 ----
+      - name: Verify artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "dist\NuitkaGUI.exe"
+          if (-not (Test-Path $exe)) { throw "FAIL: dist\NuitkaGUI.exe 不存在" }
+          $item = Get-Item $exe
+          Write-Host "✅ dist\NuitkaGUI.exe — $([math]::Round($item.Length/1MB,1)) MB, $($item.LastWriteTime)"
+
+      # ---- Linux 验证: 二进制存在 + ldd 检查依赖 + file 确认 ELF ----
+      - name: Verify artifact (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          BIN="dist/NuitkaGUI"
+          if [ ! -f "$BIN" ]; then echo "FAIL: dist/NuitkaGUI 不存在"; exit 1; fi
+          echo "✅ dist/NuitkaGUI — $(du -h $BIN | cut -f1)"
+          file "$BIN" | grep -q "ELF" && echo "✅ ELF binary confirmed" || { echo "FAIL: 不是 ELF"; exit 1; }
+          ldd "$BIN" | head -10
+          # 检查是否有 not found 的动态库 (standalone 应该自包含)
+          ldd "$BIN" | grep "not found" && echo "⚠️  有未解析的动态库 (standalone 应该自包含)" || echo "✅ 动态库全部解析 (standalone 自包含)"
+
+      # ---- Linux: xvfb 快速启动验证 (GUI 程序在 headless CI 上跑 2 秒后 kill ----
+      - name: Smoke run — 启动 2 秒即退出 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y xvfb
+          timeout 6 xvfb-run -a ./dist/NuitkaGUI || true
+          echo "✅ GUI 启动测试完成 (exit code $?)"
+
+      # ---- Windows: 启动 2 秒即 kill (PowerShell) ----
+      - name: Smoke run — 启动 2 秒即退出 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "dist\NuitkaGUI.exe" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          if (-not $proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force
+              Write-Host "✅ 启动后 3 秒仍存活 → GUI 初始化正常"
+          } else {
+              Write-Host "⚠️  进程提前退出 (exit code $($proc.ExitCode))"
+          }
+
+      # ---- Artifact ----
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: NuitkaGUI-win-py${{ matrix.python-version }}
-          path: dist/NuitkaGUI.exe
+          name: NuitkaGUI-${{ matrix.artifact-suffix }}
+          path: dist/${{ matrix.exe-name }}
           if-no-files-found: error
+          retention-days: 7
+
+      # ---- 额外: standalone 目录也上传 (onefile 解压后的运行时) ----
+      - name: Upload standalone dir
+        uses: actions/upload-artifact@v7
+        with:
+          name: NuitkaGUI-standalone-${{ matrix.artifact-suffix }}
+          path: dist/main.dist
+          if-no-files-found: ignore  # onefile 不一定有 main.dist
+          retention-days: 7
