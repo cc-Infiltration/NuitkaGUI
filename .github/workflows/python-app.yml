@@ -106,18 +106,31 @@ jobs:
           $isLinux = '${{ runner.os }}' -eq 'Linux'
           $exeName = if ($isLinux) { 'NuitkaGUI' } else { 'NuitkaGUI.exe' }
 
-          # 用数组 splat, 空字符串会被 Where-Object 过滤掉, 不会变成 Nuitka 的空参数
-          $flags = @(
-            '--standalone', '--onefile', '--enable-plugin=pyside6',
-            '--assume-yes-for-downloads', '--jobs=4',
-            ${{ matrix.nuitka-compiler-flag }},
-            $(if ($isLinux) { '' } else { '--windows-console-mode=disable --windows-icon-from-ico=a.ico --include-data-files=a.ico=a.ico' }),
-            '--output-filename=' + $exeName,
-            '--output-dir=dist',
-            'main.py'
-          ) | Where-Object { $_ -ne '' }
+          # 纯 PowerShell 构建数组 — 不用模板变量在数组字面量里, 避免空值产生语法错误
+          $flags = New-Object System.Collections.Generic.List[string]
+          $flags.Add('--standalone')
+          $flags.Add('--onefile')
+          $flags.Add('--enable-plugin=pyside6')
+          $flags.Add('--assume-yes-for-downloads')
+          $flags.Add('--jobs=4')
 
-          python -m nuitka @flags
+          # 编译器参数 — 非空才加
+          $cc = '${{ matrix.nuitka-compiler-flag }}'
+          if ($cc) { $flags.Add($cc) }
+
+          # Windows 专属 flag
+          if (-not $isLinux) {
+            $flags.Add('--windows-console-mode=disable')
+            $flags.Add('--windows-icon-from-ico=a.ico')
+            $flags.Add('--include-data-files=a.ico=a.ico')
+          }
+
+          $flags.Add('--output-filename=' + $exeName)
+          $flags.Add('--output-dir=dist')
+          $flags.Add('main.py')
+
+          Write-Host "nuitka args: $($flags -join ' ')"
+          python -m nuitka $flags
 
       # ---- 验证 ----
       - name: verify (Windows)
