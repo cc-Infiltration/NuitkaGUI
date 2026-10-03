@@ -17,15 +17,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - name: Windows+GCC
+            os: windows-latest
             python-version: '3.12'
             nuitka-compiler-flag: '--mingw64'
             needs-vcvars: false
-          - os: windows-latest
+          - name: Windows+VC
+            os: windows-latest
             python-version: '3.13'
             nuitka-compiler-flag: ''
             needs-vcvars: true
-          - os: ubuntu-24.04
+          - name: Ubuntu+gcc
+            os: ubuntu-24.04
             python-version: '3.13'
             nuitka-compiler-flag: ''
             needs-vcvars: false
@@ -136,7 +139,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: NuitkaGUI-${{ matrix.os }}-py${{ matrix.python-version }}
+          name: NuitkaGUI-${{ matrix.name }}
           path: dist
           if-no-files-found: error
           retention-days: 7
