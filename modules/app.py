@@ -8,7 +8,8 @@ import sys
 import threading
 
 from PySide6.QtCore import (
-    QElapsedTimer, QObject, QPointF, QRegularExpression, Qt, QTimer, Signal,
+    QElapsedTimer, QObject, QPoint, QPointF, QRegularExpression, Qt, QTimer,
+    Signal,
 )
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QFont, QPainter, QPolygonF,
@@ -18,8 +19,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHeaderView,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
-    QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
+    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSpinBox,
+    QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QToolTip,
     QVBoxLayout, QWidget,
 )
 
@@ -56,12 +57,60 @@ def _load_qss(name):
 APP_QSS = _load_qss("light.qss")
 APP_DARK_QSS = _load_qss("dark.qss")
 
-# Nuitka 插件名区分大小写
-PLUGIN_OPTIONS = [
-    "tk-inter", "pyqt5", "pyqt6", "pyside2", "pyside6",
-    "upx", "no-qt", "dll-files", "anti-bloat",
-    "pygame", "trio", "glfw", "loguru",
-]
+# Nuitka 4.2.2 全部 37 个内置插件 (来源: nuitka/plugins/standard/*.py 的 plugin_name)
+# 按用途分组展示; 插件名区分大小写, 必须小写
+PLUGIN_GROUPS = (
+    ("GUI / 图形界面", (
+        ("pyside6", "PySide6 (Qt for Python) 应用"),
+        ("pyside2", "PySide2 (Qt for Python) 应用"),
+        ("pyqt6", "PyQt6 应用"),
+        ("pyqt5", "PyQt5 应用"),
+        ("tk-inter", "Tkinter 界面 (自动包含 TCL 运行库)"),
+        ("kivy", "Kivy 多媒体应用"),
+        ("glfw", "GLFW OpenGL 窗口程序"),
+        ("pywebview", "pywebview 轻量级网页界面"),
+        ("gi", "GTK / PyGObject (gi) 应用"),
+        ("pmw-freezer", "Pmw (Tkinter 组件库) 应用"),
+        ("no-qt", "目标程序完全不依赖 Qt 时使用, 排除 Qt 相关处理"),
+    )),
+    ("压缩 / 兼容", (
+        ("upx", "UPX 压缩可执行文件 (需先安装 UPX, 未安装时选项标红)"),
+        ("anti-bloat", "剔除冗余依赖与警告噪音, 减小体积、加快编译"),
+        ("dll-files", "按第三方包配置自动打入相关 dll; 可能增大产物体积, 谨慎使用"),
+        ("delvewheel", "修复 delvewheel 打包的 wheel (含外部 dll)"),
+        ("enum-compat", "enum34 兼容补丁 (仅旧依赖需要)"),
+        ("dill-compat", "dill 序列化兼容支持"),
+        ("pbr-compat", "pbr 打包兼容支持"),
+    )),
+    ("数据科学 / 机器学习", (
+        ("numpy", "NumPy 数值计算库"),
+        ("matplotlib", "Matplotlib 绘图库"),
+        ("tensorflow", "TensorFlow 深度学习框架"),
+        ("torch", "PyTorch 深度学习框架"),
+        ("torch-hub", "PyTorch Hub 预训练模型下载"),
+        ("torch-jit", "PyTorch JIT (TorchScript) 模型"),
+        ("transformers", "Hugging Face Transformers 模型"),
+        ("spacy", "spaCy 自然语言处理库"),
+    )),
+    ("并发 / 网络", (
+        ("trio", "Trio 异步框架"),
+        ("gevent", "gevent 协程库"),
+        ("eventlet", "eventlet 协程库"),
+        ("multiprocessing", "multiprocessing 多进程 (用到多进程时勾选)"),
+        ("playwright", "Playwright 浏览器自动化"),
+    )),
+    ("内部 / 高级", (
+        ("pylint-warnings", "遵循 pylint 注释控制隐式导入"),
+        ("pkg-resources", "pkg_resources 入口点 (entry points) 支持"),
+        ("options-nanny", "检查 Nuitka 选项组合是否合理"),
+        ("implicit-imports", "允许插件声明隐式导入 (调试缺失模块用)"),
+        ("source-inclusion", "将源码包含进产物, 便于回溯调试"),
+        ("data-files", "自动包含已安装包内的数据文件"),
+    )),
+)
+
+# 扁平插件名列表 (保持兼容: 配置读取/收藏等按名字索引)
+PLUGIN_OPTIONS = [name for _, plugins in PLUGIN_GROUPS for name, _ in plugins]
 
 MODE_OPTIONS = (
     ("onefile", "单文件打包 (--onefile)"),
@@ -464,6 +513,36 @@ def collapsible_qss(theme):
             "border:1px solid #e3e8ef;border-radius:8px;}")
 
 
+def _sanitize_dest(dest):
+    """清洗并校验"程序内"目标路径; 非法返回 None, 空返回 ""。
+
+    Nuitka 的 --include-data-dir/files 目标必须是相对可执行文件的相对路径,
+    以下情况会导致打包失败或产物结构错乱, 一律拒绝:
+    - 盘符 (C:...) 或前导 / \\ (绝对路径)
+    - ".." (路径逃逸出产物根目录)
+    - 通配符与 shell/文件名敏感字符 (* ? " ' < > |)
+    反斜杠统一为正斜杠, 折叠 "." 与重复斜杠。
+    """
+    dest = (dest or "").strip().replace("\\", "/")
+    if not dest:
+        return ""
+    if re.match(r"^[A-Za-z]:", dest) or dest.startswith("/"):
+        return None
+    parts = []
+    for part in dest.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            return None
+        parts.append(part)
+    if not parts:
+        return ""
+    cleaned = "/".join(parts)
+    if any(ch in cleaned for ch in "*?\"'<>|"):
+        return None
+    return cleaned
+
+
 class RowTableEditor(QGroupBox):
     """数据资源编辑器: 两列"本地 → 程序内"表格, 表头自解释, 无需说明文字。
 
@@ -471,8 +550,11 @@ class RowTableEditor(QGroupBox):
     存放位置, 比"来源=目标"自由文本直观得多。
     """
 
-    def __init__(self, title, parent=None):
+    def __init__(self, title, parent=None, picker="dir", root_resolver=None):
         super().__init__(title, parent)
+        self._picker = picker  # "dir" 浏览选目录 / "file" 浏览选文件
+        # 返回项目源码根目录(主脚本所在目录)的回调; 用于计算资源相对路径
+        self._root_resolver = root_resolver
         self._items = []  # [(src, dest), ...]
         layout = QVBoxLayout(self)
         layout.setSpacing(6)
@@ -482,12 +564,18 @@ class RowTableEditor(QGroupBox):
         entry_row.addWidget(QLabel("本地"))
         self.ed_src = QLineEdit()
         entry_row.addWidget(self.ed_src, 1)
+        browse_btn = QPushButton("浏览...")
+        browse_btn.clicked.connect(self._browse)
+        self._browse_btn = browse_btn
+        entry_row.addWidget(browse_btn)
         entry_row.addWidget(QLabel("→"))
         entry_row.addWidget(QLabel("程序内"))
         self.ed_dest = QLineEdit()
+        self.ed_dest.setPlaceholderText("可留空")
         entry_row.addWidget(self.ed_dest, 1)
         add_btn = QPushButton("+ 添加")
         add_btn.clicked.connect(self._add)
+        self._add_btn = add_btn
         entry_row.addWidget(add_btn)
         layout.addLayout(entry_row)
 
@@ -505,11 +593,106 @@ class RowTableEditor(QGroupBox):
         rm_btn.clicked.connect(self._remove)
         layout.addWidget(rm_btn)
 
+    def _project_root(self):
+        """项目源码根目录: 主脚本所在目录; 未选脚本时返回 None。"""
+        if not callable(self._root_resolver):
+            return None
+        try:
+            root = self._root_resolver()
+        except Exception:
+            return None
+        if root:
+            root = os.path.abspath(root)
+            if os.path.isdir(root):
+                return root
+        return None
+
+    def _compute_dest(self, path):
+        """由所选路径推算"程序内"目标路径 (相对项目根目录)。
+
+        已选主脚本 → 计算相对主脚本所在目录的路径, 使产物内结构与源码
+        目录一致, 运行时以相对路径引用最稳妥。
+        异常处理:
+        - Windows 跨盘符无法计算 → 提示并退化为文件名;
+        - 资源在项目根之外 (relpath 含 ..) → 剥离前导 .. 段并提示;
+        - 未选主脚本 / 资源就是项目根本身 → 退化为文件名。
+        """
+        root = self._project_root()
+        if not root:
+            return os.path.basename(path.rstrip("/\\"))
+        try:
+            rel = os.path.relpath(path, root)
+        except ValueError:
+            # Windows 跨盘符 (如 D: 与 E:), relpath 无法计算
+            self._warn("所选资源与主脚本不在同一磁盘, 无法计算相对"
+                       "路径, 已使用文件名作为程序内路径")
+            return os.path.basename(path.rstrip("/\\"))
+        parts = rel.replace("\\", "/").split("/")
+        outside = False
+        while parts and parts[0] == "..":
+            parts.pop(0)
+            outside = True
+        # 去掉 "." 段 (如资源就是项目根本身时 relpath = ".")
+        parts = [p for p in parts if p != "."]
+        if not parts:
+            return os.path.basename(path.rstrip("/\\"))
+        dest = "/".join(parts)
+        if outside:
+            self._warn("所选资源在项目源码根目录之外, 程序内路径"
+                       "已截断为 %r" % dest)
+        return dest
+
+    def _browse(self):
+        """浏览选择本地文件/目录; 选中后自动推算目标路径并直接加入列表。
+
+        浏览即生效: 省去"填完还要点添加"的步骤, 资源立即进入打包命令
+        (预览命令中可见)。用户已填目标路径时尊重原值; 若被校验/冲突
+        检测拒绝, 输入保留并气泡说明原因, 改完点「+ 添加」即可。
+        """
+        if self._picker == "file":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择文件", "", "所有文件 (*.*)")
+        else:
+            path = QFileDialog.getExistingDirectory(self, "选择目录")
+        if not path:
+            return
+        self.ed_src.setText(path)
+        if not self.ed_dest.text().strip():
+            dest = self._compute_dest(path)
+            if dest:
+                self.ed_dest.setText(dest)
+        self._add()
+
+    def set_input_enabled(self, enabled):
+        """启用/禁用填写控件(浏览/来源/目标/添加); 表格与删除不受影响。"""
+        for w in (self._browse_btn, self.ed_src, self.ed_dest, self._add_btn):
+            w.setEnabled(enabled)
+
+    def _warn(self, msg):
+        """在「+ 添加」按钮处弹出气泡提示, 不打断操作、不清空已填内容。"""
+        QToolTip.showText(
+            self._add_btn.mapToGlobal(QPoint(0, self._add_btn.height())),
+            msg, self._add_btn)
+
     def _add(self):
         src = self.ed_src.text().strip()
         if not src:
             return
-        dest = self.ed_dest.text().strip()
+        dest = _sanitize_dest(self.ed_dest.text())
+        if dest is None:
+            self._warn("程序内路径必须是相对路径: 不能以盘符或 / 开头, "
+                       "不能含 .. 与 * ? \" ' < > | 等字符")
+            return
+        # 目标冲突检测: 空 dest 时 Nuitka 按源 basename 放置, 同 basename
+        # 的多个条目会互相覆盖 (Duplication), 按同一把尺子查重
+        effective = dest or os.path.basename(src.rstrip("/\\"))
+        for exist_src, exist_dest in self._items:
+            exist_effective = exist_dest or os.path.basename(
+                exist_src.rstrip("/\\"))
+            if effective and effective == exist_effective:
+                self._warn("目标路径 %r 已被占用, 请修改「程序内」列区分"
+                           % effective)
+                return
         self._items.append((src, dest))
         row = self.table.rowCount()
         self.table.insertRow(row)
@@ -563,8 +746,14 @@ class ModuleListEditor(QGroupBox):
         radio_row.setSpacing(14)
         self.radio = {}
         grp = QButtonGroup(self)
+        type_tips = {
+            "include_packages": "包含包: 将整个 Python 包(含其数据文件)打入产物",
+            "include_modules": "包含模块: 将单个 .py 模块打入产物",
+            "exclude_modules": "排除导入: 打包时排除不需要的模块, 减小产物体积",
+        }
         for key, _label in self.TYPES:
             rb = QRadioButton("")
+            rb.setToolTip(type_tips[key])
             self.radio[key] = rb
             grp.addButton(rb)
             rb.toggled.connect(self._refresh_list)
@@ -723,6 +912,8 @@ class NuitkaGUI(QMainWindow):
         grid.addWidget(self.ed_output_name, 2, 1)
         grid.addWidget(label("打包模式:"), 2, 2)
         grid.addWidget(self.cb_mode, 2, 3)
+        # 模式切换实时同步数据页签: 仅单文件模式允许填写(页签未构建时安全跳过)
+        self.cb_mode.currentIndexChanged.connect(self._sync_data_tab_mode)
         grid.addWidget(label("控制台:"), 3, 0)
         grid.addLayout(console_row, 3, 1)
         grid.setColumnStretch(1, 1)
@@ -846,36 +1037,59 @@ class NuitkaGUI(QMainWindow):
     def _build_plugin_tab(self):
         scroll, content = self._scrollable()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(16, 16, 16, 16)
-        plugin_group = QGroupBox("启用插件 (可多选)")
-        grid = QGridLayout(plugin_group)
-        grid.setContentsMargins(12, 16, 12, 12)
-        grid.setHorizontalSpacing(18)
-        grid.setVerticalSpacing(6)
-        cols = 5
-        self.plugin_checks = {}
-        cell = 0
-        for name in PLUGIN_OPTIONS:
-            if name == "dll-files":  # 单独放到底部兜底区域
-                continue
-            cb = QCheckBox(name)
-            self.plugin_checks[name] = cb
-            grid.addWidget(cb, cell // cols, cell % cols)
-            cell += 1
-        # UPX 勾选后检查是否存在, 缺失时以淡红提示
-        self.plugin_checks["upx"].toggled.connect(self._update_upx_marker)
-        layout.addWidget(plugin_group)
+        layout.setContentsMargins(16, 14, 16, 16)
+        layout.setSpacing(10)
 
-        # dll-files 单独放在下面, 作为第三方包 dll 的兜底选项
-        fallback_group = QGroupBox("兜底选项")
-        fallback_layout = QVBoxLayout(fallback_group)
-        fallback_layout.setContentsMargins(12, 14, 12, 12)
-        cb_dll = QCheckBox("dll-files")
-        cb_dll.setToolTip("根据第三方包的配置文件，自动将相关的dll打包\n"
-                          "注意: 这可能会增加构建产物的大小与启动速度, 请谨慎使用")
-        self.plugin_checks["dll-files"] = cb_dll
-        fallback_layout.addWidget(cb_dll)
-        layout.addWidget(fallback_group)
+        # 运行时自动发现 Nuitka 实际安装的插件 (deps 静态解析, 不执行插件代码)
+        available = deps.list_nuitka_plugins()
+        ok_nuitka, nuitka_ver = deps.check_nuitka()
+        info = QLabel()
+        info.setProperty("hint", True)
+        info.setWordWrap(True)
+        if available:
+            info.setText("已自动发现 %d 个插件 (Nuitka %s)。Nuitka 升级新增的插件"
+                         "会自动出现在「其他」组, 已移除的插件不再显示。"
+                         % (len(available), nuitka_ver if ok_nuitka else "未知版本"))
+        else:
+            info.setText("未能自动发现插件 (未检测到 Nuitka 安装), 暂时显示内置列表;"
+                         " 安装 Nuitka 后重启本工具即切换为自动发现。")
+        layout.addWidget(info)
+
+        # 分组视图: 已知插件沿用内置分组与说明, 仅保留实际安装存在的;
+        # 内置列表之外的新发现插件归入「其他」; 发现失败则回退内置全量
+        known = {name for _, plugins in PLUGIN_GROUPS for name, _ in plugins}
+        if available:
+            groups = [(title, [(n, t) for n, t in plugins if n in available])
+                      for title, plugins in PLUGIN_GROUPS]
+            extra = sorted(available - known)
+            if extra:
+                groups.append(("其他 (自动发现)",
+                               [(n, "Nuitka 新增插件, 暂无说明") for n in extra]))
+        else:
+            groups = list(PLUGIN_GROUPS)
+
+        self.plugin_checks = {}
+        cols = 5
+        for group_title, plugins in groups:
+            if not plugins:
+                continue
+            group = QGroupBox(group_title)
+            grid = QGridLayout(group)
+            grid.setContentsMargins(12, 14, 12, 12)
+            grid.setHorizontalSpacing(18)
+            grid.setVerticalSpacing(6)
+            for cell, (name, tip) in enumerate(plugins):
+                cb = QCheckBox(name)
+                if tip:
+                    cb.setToolTip(tip)
+                self.plugin_checks[name] = cb
+                grid.addWidget(cb, cell // cols, cell % cols)
+            layout.addWidget(group)
+
+        # UPX 勾选后检查是否存在, 缺失时以淡红提示
+        upx_cb = self.plugin_checks.get("upx")
+        if upx_cb is not None:
+            upx_cb.toggled.connect(self._update_upx_marker)
         layout.addStretch()
         return scroll
 
@@ -937,15 +1151,49 @@ class NuitkaGUI(QMainWindow):
         layout.setContentsMargins(16, 14, 16, 16)
         layout.setSpacing(10)
 
-        self.ed_data_dirs = RowTableEditor("数据目录")
-        self.ed_data_files = RowTableEditor("数据文件")
+        # 数据资源仅单文件模式有效; 其他模式下停用填写并在此说明原因
+        self.data_mode_hint = QLabel()
+        self.data_mode_hint.setProperty("hint", True)
+        self.data_mode_hint.setWordWrap(True)
+        layout.addWidget(self.data_mode_hint)
+
+        root_resolver = lambda: (
+            os.path.dirname(self.ed_script.text().strip()) or None)
+        self.ed_data_dirs = RowTableEditor(
+            "数据目录", picker="dir", root_resolver=root_resolver)
+        self.ed_data_files = RowTableEditor(
+            "数据文件", picker="file", root_resolver=root_resolver)
         self.ed_modules = ModuleListEditor()
 
         layout.addWidget(self.ed_data_dirs)
         layout.addWidget(self.ed_data_files)
         layout.addWidget(self.ed_modules)
         layout.addStretch()
+        self._sync_data_tab_mode()
         return scroll
+
+    def _sync_data_tab_mode(self):
+        """按打包模式同步数据资源填写区: 仅单文件模式允许填写。
+
+        非单文件模式下停用浏览/来源/目标/添加控件并显示提示;
+        已添加的条目保留不丢失, 切回单文件模式即恢复填写。
+        """
+        if not hasattr(self, "ed_data_dirs"):
+            return  # 数据页签尚未构建
+        mode = MODE_FROM_LABEL.get(self.cb_mode.currentText(), "onefile")
+        is_onefile = mode == "onefile"
+        self.ed_data_dirs.set_input_enabled(is_onefile)
+        self.ed_data_files.set_input_enabled(is_onefile)
+        if hasattr(self, "data_mode_hint"):
+            if is_onefile:
+                self.data_mode_hint.setVisible(False)
+            else:
+                self.data_mode_hint.setText(
+                    "数据目录/文件仅在单文件打包 (--onefile) 模式下有效。"
+                    "当前模式「%s」已停用填写, 切换到单文件模式后恢复; "
+                    "已添加的条目会保留, 不会丢失。"
+                    % self.cb_mode.currentText())
+                self.data_mode_hint.setVisible(True)
 
     def _build_win_tab(self):
         scroll, content = self._scrollable()

@@ -8,6 +8,8 @@
 - run_mingw_download(): 通过一次极简编译触发 Nuitka 自动下载 MinGW64。
 """
 
+import ast
+import importlib.util
 import json
 import os
 import re
@@ -320,6 +322,102 @@ def check_nuitka():
         if ver:
             return True, ver
     return False, "未检测到"
+
+
+# 合法 Nuitka 插件名: 小写字母/数字开头, 仅含小写字母、数字、连字符
+# 插件名最终进入命令行 --enable-plugin=<name>, 必须拒绝路径分隔符、空格、
+# 引号等一切非常量字符, 防命令/路径注入
+_PLUGIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# 单个插件源文件大小上限, 防止异常超大文件拖慢启动解析
+_PLUGIN_SCAN_LIMIT_BYTES = 1024 * 1024
+
+
+def _nuitka_package_dir():
+    """定位 nuitka 包目录; 未安装返回 None。
+
+    用 find_spec 只查询不导入, 避免执行 nuitka/__init__.py。
+    """
+    try:
+        spec = importlib.util.find_spec("nuitka")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    for loc in spec.submodule_search_locations:
+        if loc and os.path.isdir(loc):
+            return loc
+    return None
+
+
+def _extract_plugin_names(source):
+    """AST 静态提取源码中的 plugin_name 字符串常量。
+
+    只解析语法树、读取字符串字面量, 绝不 import/exec 插件模块 —
+    插件文件内容不可信时也不会执行任何代码。语法错误返回空集合。
+    """
+    names = set()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return names
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not (isinstance(target, ast.Name) and target.id == "plugin_name"):
+                continue
+            value = node.value
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                name = value.value.strip()
+                if _PLUGIN_NAME_RE.match(name):
+                    names.add(name)
+    return names
+
+
+def list_nuitka_plugins():
+    """自动发现当前 Nuitka 安装的全部内置插件名, 返回 set。
+
+    安全设计:
+    - 只静态解析 nuitka/plugins/standard/*.py 的 plugin_name (AST),
+      不 import 任何插件模块, 不执行第三方代码
+    - 插件名白名单校验 (小写字母/数字/连字符), 防命令与路径注入
+    - 不跟随符号链接; 真实路径必须仍在 standard 目录内 (防链接逃逸)
+    - 跳过超大文件与解析失败的单文件, 不影响其余插件发现
+    Nuitka 未安装或目录异常时返回空集合 (调用方回退内置列表)。
+    """
+    nuitka_dir = _nuitka_package_dir()
+    if not nuitka_dir:
+        return set()
+    std_dir = os.path.join(nuitka_dir, "plugins", "standard")
+    if not os.path.isdir(std_dir):
+        return set()
+    try:
+        std_real = os.path.realpath(std_dir)
+        entries = list(os.scandir(std_dir))
+    except OSError:
+        return set()
+    names = set()
+    for entry in entries:
+        try:
+            if not entry.name.endswith(".py") or entry.name == "__init__.py":
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            entry_real = os.path.realpath(entry.path)
+            try:
+                inside = os.path.commonpath([std_real, entry_real]) == std_real
+            except ValueError:  # 跨盘符等, 视为逃逸
+                inside = False
+            if not inside:
+                continue
+            if entry.stat(follow_symlinks=False).st_size > _PLUGIN_SCAN_LIMIT_BYTES:
+                continue
+            with open(entry.path, "r", encoding="utf-8", errors="replace") as f:
+                source = f.read()
+        except OSError:
+            continue
+        names |= _extract_plugin_names(source)
+    return names
 
 
 def _walk_limited(root, max_depth=3):
