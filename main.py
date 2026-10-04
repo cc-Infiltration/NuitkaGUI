@@ -29,7 +29,7 @@ def main():
     app.setApplicationName("Nuitka 打包工具")
     app.setOrganizationName("NuitkaGUI")
 
-    # 窗口/任务栏图标
+    # 窗口和任务栏图标
     icon_path = _find_icon()
     if icon_path:
         app.setWindowIcon(QIcon(icon_path))
