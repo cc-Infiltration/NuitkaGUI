@@ -825,16 +825,8 @@ class NuitkaGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Nuitka 打包工具")
-        self.setMinimumSize(720, 560)
-        # 窗口尺寸自适应屏幕: 低分辨率下不超出屏幕, 高分辨率下保持舒适尺寸
-        screen = QApplication.primaryScreen()
-        if screen:
-            geo = screen.availableGeometry()
-            w = min(1080, max(720, geo.width() - 40))
-            h = min(860, max(560, geo.height() - 60))
-            self.resize(w, h)
-        else:
-            self.resize(1060, 820)
+        self.setMinimumSize(900, 640)
+        self.resize(900, 640)
 
         self.stop_event = threading.Event()
         self.building = False
