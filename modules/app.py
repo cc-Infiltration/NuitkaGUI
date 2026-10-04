@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import deps
-from .builder import build_command, run_build
+from .builder import build_command, run_build, stop_active_builds
 from .config import DEFAULT_CONFIG, DEFAULT_SCRIPT, load_config, save_config
 
 
@@ -1335,10 +1335,12 @@ class NuitkaGUI(QMainWindow):
         self.lbl_status.setText("配置已保存")
 
     def _load_config_now(self):
-        if QMessageBox.question(self, "加载配置", "确定从已保存的配置恢复当前设置吗?"):
-            self._load_from_config(load_config())
-            self._apply_theme(self.theme)
-            self.lbl_status.setText("配置已加载")
+        if QMessageBox.question(self, "加载配置", "确定从已保存的配置恢复当前设置吗?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self._load_from_config(load_config())
+        self._apply_theme(self.theme)
+        self.lbl_status.setText("配置已加载")
 
     # ---------- 主题 ----------
     def _apply_theme(self, theme):
@@ -1649,5 +1651,8 @@ class NuitkaGUI(QMainWindow):
                     != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            # 必须在本进程退出前杀掉 Nuitka/scons 进程树:
+            # 后台线程是 daemon, 窗口关闭后不会再跑 run_process 里的取消逻辑
+            stop_active_builds(self.stop_event)
         save_config(self._collect_config())
         event.accept()

@@ -44,6 +44,34 @@ _EXTRA_ARGS_BLOCKLIST = frozenset([
 # 可运行 `python -m nuitka` 的解释器路径(解析后缓存)
 _PYTHON_EXE = None
 
+# 当前仍在跑的 Nuitka 子进程 (GUI 退出时需硬杀进程树)
+_ACTIVE_PROCS = []
+_ACTIVE_LOCK = threading.Lock()
+
+
+def _register_proc(proc):
+    with _ACTIVE_LOCK:
+        _ACTIVE_PROCS.append(proc)
+
+
+def _unregister_proc(proc):
+    with _ACTIVE_LOCK:
+        try:
+            _ACTIVE_PROCS.remove(proc)
+        except ValueError:
+            pass
+
+
+def stop_active_builds(stop_event=None):
+    """通知取消并杀掉仍在运行的 Nuitka 进程树。可从 GUI 线程在退出时调用。"""
+    if stop_event is not None:
+        stop_event.set()
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE_PROCS)
+    for proc in procs:
+        if proc.poll() is None:
+            _kill_process_tree(proc)
+
 
 def _is_onefile_temp(path):
     """Nuitka onefile 解包临时目录特征: 在系统临时目录下且路径含 onefile_"""
@@ -463,8 +491,10 @@ def run_process(cmd, cwd, log_queue, stop_event, cfg=None):
     stderr 行 → ("error", text)  — 错误/警告 (Nuitka FATAL/WARNING 级)
     """
     try:
-        creationflags = subprocess.CREATE_NO_WINDOW
+        # CREATE_NO_WINDOW 仅 Windows 存在; 非 Windows 传 0, 并用 start_new_session
+        creationflags = 0
         if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW
             # CREATE_NEW_PROCESS_GROUP 让子进程成为新进程组 leader,
             # 方便 taskkill /T 追踪全部后代 (scons, gcc 等)
             creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -474,7 +504,7 @@ def run_process(cmd, cwd, log_queue, stop_event, cfg=None):
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-            creationflags=creationflags if os.name == "nt" else 0,
+            creationflags=creationflags,
             start_new_session=(os.name != "nt"),
             cwd=cwd or None,
             env=_build_env(cfg, log_queue),
@@ -482,6 +512,7 @@ def run_process(cmd, cwd, log_queue, stop_event, cfg=None):
     except Exception as exc:
         log_queue.put(("error", "无法启动命令: %s" % exc))
         return -1
+    _register_proc(proc)
 
     def _pump(pipe, kind):
         """通用行流读取: kind='line' 走 stdout (普通输出), kind='error' 走 stderr (错误)"""
@@ -501,9 +532,12 @@ def run_process(cmd, cwd, log_queue, stop_event, cfg=None):
     threading.Thread(target=_pump, args=(proc.stderr, "error"),
                      daemon=True).start()
 
-    while proc.poll() is None:
-        if stop_event.wait(0.2):
-            _kill_process_tree(proc)
-            log_queue.put(("line", "[已取消]"))
-            return -2
-    return proc.returncode
+    try:
+        while proc.poll() is None:
+            if stop_event.wait(0.2):
+                _kill_process_tree(proc)
+                log_queue.put(("line", "[已取消]"))
+                return -2
+        return proc.returncode
+    finally:
+        _unregister_proc(proc)
