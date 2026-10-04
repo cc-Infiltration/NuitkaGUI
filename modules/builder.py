@@ -230,7 +230,7 @@ def build_command(cfg):
     if jobs > 1:
         cmd.append("--jobs=%d" % jobs)
 
-    # 始终自动确认下载(含首次 MinGW64 编译器), 避免无控制台窗口时被询问而卡住
+    # 始终自动确认下载(含首次 MinGW64 编译器),避免无控制台窗口时被询问而卡住
     cmd.append("--assume-yes-for-downloads")
     if cfg.get("remove_output"):
         cmd.append("--remove-output")
@@ -343,7 +343,7 @@ def _build_env(cfg, log_queue):
             env["NUITKA_CACHE_DIR"] = cache_dir
             log_queue.put(("line", "[环境] Nuitka 缓存目录: %s" % cache_dir))
 
-    # 2) Qt 插件目录自动探测 (修复 PyQt5/PySide 在 Python 3.13+ 上的布局问题)
+    # Qt 插件目录自动探测 (修复 PyQt5/PySide 在 Python 3.13+ 上的布局问题)
     python_exe = resolve_python()
     if python_exe:
         qt_dirs = _detect_qt_plugin_dirs(python_exe)
@@ -384,7 +384,6 @@ def run_build(log_queue, stop_event, cfg):
     参数顺序与 BuildWorker 约定一致: (log_queue, stop_event, cfg)
     log_queue 消息格式: ("cmd",命令行) / ("line", 文本) / ("error", 文本) / ("done", 退出码)
     """
-    # === TOCTOU 二次校验 (真正使用文件的一方做最终确认) ===
     # UI 线程的 os.path.isfile 只是快路径预检; 从 UI 检查到 Nuitka 实际读文件之间
     # 有数百毫秒间隔, 本地攻击者可在窗口内替换目标脚本/图标。
     # 这里在后台线程启动后立即校验, 拿真实 I/O 时再确认一次。
@@ -438,7 +437,6 @@ def _kill_process_tree(proc):
             pass
         proc.kill()   # 兜底
     else:
-        # POSIX: 假设 start_new_session=True, 进程组 leader = proc.pid
         import signal
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
