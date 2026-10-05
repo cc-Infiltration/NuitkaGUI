@@ -315,6 +315,7 @@ def _detect_qt_plugin_dirs(python_exe):
     适配多种安装布局: PyQt5/Qt5/plugins (新) vs PyQt5/plugins (旧)。
     返回已找到且含 platforms 子目录的绝对路径列表, 找不到返回 []。
     """
+    # 内嵌 probe 脚本内部有合法的 try/except/pass, 无需顶层再检查
     probe = (
         "import os, importlib.util as u\n"
         "dirs=[]\n"
@@ -322,7 +323,8 @@ def _detect_qt_plugin_dirs(python_exe):
         "    if not u.find_spec(b): continue\n"
         "    try:\n"
         "        m=__import__(b); d=os.path.dirname(m.__file__)\n"
-        "        for c in [os.path.join(d,'Qt5','plugins'),os.path.join(d,'Qt6','plugins'),os.path.join(d,'plugins')]:\n"
+        "        for sub in ['Qt5/plugins','Qt6/plugins','plugins']:\n"
+        "            c=os.path.join(d,sub)\n"
         "            if os.path.isdir(c) and os.path.isdir(os.path.join(c,'platforms')):\n"
         "                dirs.append(os.path.normpath(c)); break\n"
         "    except Exception: pass\n"
@@ -337,7 +339,7 @@ def _detect_qt_plugin_dirs(python_exe):
             capture_output=True, text=True, timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         if proc.returncode == 0:
-            return [l.strip() for l in proc.stdout.strip().splitlines() if l.strip()]
+            return [line.strip() for line in proc.stdout.strip().splitlines() if line.strip()]
     except (OSError, subprocess.TimeoutExpired):
         pass
     return []
@@ -457,9 +459,11 @@ def _kill_process_tree(proc):
     if os.name == "nt":
         # Windows: taskkill /T /F 杀进程树 (包括所有后代)
         # CREATE_NEW_PROCESS_GROUP 让子进程成为新进程组 leader, /T 能追踪所有后代
+        sysroot = os.environ.get("windir", r"C:\Windows")
+        taskkill_exe = os.path.join(sysroot, "System32", "taskkill.exe")
         try:
             subprocess.run(
-                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                [taskkill_exe, "/T", "/F", "/PID", str(pid)],
                 capture_output=True, timeout=5)
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -468,12 +472,12 @@ def _kill_process_tree(proc):
         import signal
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, AttributeError, OSError):
+        except (AttributeError, OSError):
             proc.kill()
     # 立刻关闭 stdout pipe, 让 pump 线程的 for-in 迭代器停止
     try:
         proc.stdout.close()
-    except Exception:
+    except OSError:
         pass
     # 等待 2 秒确保释放资源
     try:
@@ -523,8 +527,6 @@ def run_process(cmd, cwd, log_queue, stop_event, cfg=None):
                     log_queue.put((kind, stripped))
         except (ValueError, OSError):
             # pipe.close() 后迭代器抛 ValueError / OSError, 忽略
-            pass
-        except Exception:
             pass
 
     threading.Thread(target=_pump, args=(proc.stdout, "line"),

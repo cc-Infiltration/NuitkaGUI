@@ -41,7 +41,7 @@ _CL_VERSION_MAP = [
     (19, 30, "MSVC 2022"),    # 19.30 - 19.39 = VS 2022
     (19, 20, "MSVC 2019"),    # 19.20 - 19.29 = VS 2019
     (19, 10, "MSVC 2017"),    # 19.10 - 19.19 = VS 2017
-    (19, 0,  "MSVC 2015"),    # 19.00 = VS 2015
+    (19, 0, "MSVC 2015"),    # 19.00 = VS 2015
 ]
 
 # 常见的 MinGW64 安装位置(部分含版本子目录, 需要浅层探测)
@@ -106,7 +106,8 @@ def check_upx():
 
 def python_requires_msvc():
     """Windows 上 Python 3.13+ 需要 MSVC 编译器 (Nuitka 不支持 MinGW64);
-    Linux / macOS 上 Nuitka 默认使用系统 gcc/clang, 不强制 MSVC。"""
+    Linux / macOS 上 Nuitka 默认使用系统 gcc/clang, 不强制 MSVC。
+    """
     return os.name == "nt" and sys.version_info >= (3, 13)
 
 
@@ -601,7 +602,7 @@ def _find_all_gcc_windows():
                         gcc_cand = os.path.join(install_loc, "mingw64", "bin", "gcc.exe")
                         if os.path.isfile(gcc_cand):
                             _collect(gcc_cand, f"注册表: {sub}")
-                    except (OSError, FileNotFoundError):
+                    except OSError:
                         pass
                 winreg.CloseKey(k)
             except OSError:

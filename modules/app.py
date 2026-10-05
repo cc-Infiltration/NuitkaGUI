@@ -113,9 +113,9 @@ PLUGIN_GROUPS = (
 PLUGIN_OPTIONS = [name for _, plugins in PLUGIN_GROUPS for name, _ in plugins]
 
 MODE_OPTIONS = (
-    ("onefile", "单文件打包 (--onefile)"),
-    ("onedir", "单目录打包 (--standalone)"),
-    ("module", "打包为模块 (--module)"),
+    ("onefile", "单文件打包"),
+    ("onedir", "单目录打包"),
+    ("module", "打包为模块"),
 )
 MODE_TO_LABEL = dict(MODE_OPTIONS)
 MODE_FROM_LABEL = {label: value for value, label in MODE_OPTIONS}
@@ -1149,8 +1149,8 @@ class NuitkaGUI(QMainWindow):
         self.data_mode_hint.setWordWrap(True)
         layout.addWidget(self.data_mode_hint)
 
-        root_resolver = lambda: (
-            os.path.dirname(self.ed_script.text().strip()) or None)
+        def root_resolver():
+            return os.path.dirname(self.ed_script.text().strip()) or None
         self.ed_data_dirs = RowTableEditor(
             "数据目录", picker="dir", root_resolver=root_resolver)
         self.ed_data_files = RowTableEditor(
