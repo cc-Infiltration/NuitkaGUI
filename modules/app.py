@@ -129,26 +129,18 @@ LTO_TO_LABEL = dict(LTO_OPTIONS)
 LTO_FROM_LABEL = {label: value for value, label in LTO_OPTIONS}
 
 # Nuitka 输出中的阶段关键字 -> (显示文本, 进度百分比), 按进度从低到高排列。
-# C 编译阶段会叠加真实模块计数(_on_output 中处理), 其余阶段按关键字映射。
+# 关键字来源: MainControl.py 的 general.info() 调用, 已核对 Nuitka 4.2.x 实际输出。
+# C 编译阶段由 Scons 接管, 子进程模式下无模块级进度, 仅能识别"开始/链接"两端点。
 PROGRESS_STEPS = (
     ("starting python compilation", "启动 Nuitka", 2),
     ("downloading", "下载编译器/依赖", 5),
-    ("compatibility", "兼容性检查", 8),
-    ("python level compilation", "Python 编译优化", 35),
+    ("completed python level compilation", "Python 编译完成", 35),
     ("generating source code", "生成 C 源码", 50),
     ("running data composer", "生成数据", 60),
-    ("starting c compilation", "C 编译开始", 72),
-    ("completed c compilation", "C 编译完成", 85),
-    ("linking", "链接", 90),
-    ("creating", "生成产物", 95),
+    ("running c compilation", "C 编译开始", 72),
+    ("c linking", "C 编译完成/链接", 90),
     ("successfully created", "完成", 100),
 )
-
-# 用于提取 Nuitka C 编译阶段真实进度的正则(兼容多版本输出格式)
-_C_START_RE = re.compile(r"starting c compilation of (\d+) modules?", re.I)
-_C_TOGO_RE = re.compile(r"(\d+) modules? to go", re.I)
-_C_DONE_RE = re.compile(r"completed c compilation of", re.I)
-_C_BULK_RE = re.compile(r"completed (\d+) c compilation unit", re.I)
 
 # 打包失败诊断规则: (正则, 问题标题, 修复建议)。
 # 按优先级排列, 命中即认为该原因(针对日志全文匹配)。
@@ -839,9 +831,6 @@ class NuitkaGUI(QMainWindow):
         self.log_colors = LOG_COLOR_SETS["light"]
         self._built_tabs = set()
         self._pending_cfg = None
-        # C 编译真实进度计数
-        self._c_total = 0
-        self._c_done = 0
 
         cfg = load_config()
         self.theme = cfg.get("theme", "light")
@@ -1506,8 +1495,6 @@ class NuitkaGUI(QMainWindow):
         save_config(cfg)
         self.stop_event.clear()
         self._current_task = "build"
-        self._c_total = 0
-        self._c_done = 0
         self._log("========== 开始打包 ==========", "cmd")
         self._start_worker(run_build, cfg)
 
@@ -1542,35 +1529,7 @@ class NuitkaGUI(QMainWindow):
         self._log(line, level)
         low = line.lower()
 
-        # --- C 编译真实进度: 从 Nuitka 输出统计模块总数与已完成数 ---
-        m = _C_START_RE.search(low)
-        if m:
-            self._c_total = int(m.group(1))
-            self._c_done = 0
-        m = _C_DONE_RE.search(low)
-        if m:
-            self._c_done += 1
-        m = _C_TOGO_RE.search(low)
-        if m and self._c_total:
-            self._c_done = max(self._c_done, self._c_total - int(m.group(1)))
-        m = _C_BULK_RE.search(low)
-        if m:
-            self._c_done += int(m.group(1))
-
-        if self._c_total:
-            done = min(self._c_done, self._c_total)
-            if 0 < done < self._c_total:
-                pct = 72 + round(done / self._c_total * 13)
-                self.lbl_status.setText(
-                    "C 编译中: %d/%d (%d%%)" % (done, self._c_total, pct))
-                return
-            if done >= self._c_total:
-                # 本行标记编译完成; 清零总数, 让后续"链接/生成/完成"行走关键字映射
-                self.lbl_status.setText("C 编译完成 (85%%)")
-                self._c_total = 0
-                return
-
-        # --- 阶段关键字映射 ---
+        # --- 阶段关键字映射: 命中即更新状态文字 + 百分比 ---
         for _kw, _label, pct in PROGRESS_STEPS:
             if _kw in low:
                 self.lbl_status.setText("%s (%d%%)" % (_label, pct))

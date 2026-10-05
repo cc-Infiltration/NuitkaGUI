@@ -529,9 +529,12 @@ def run_process(cmd, cwd, log_queue, stop_event, cfg=None):
             # pipe.close() 后迭代器抛 ValueError / OSError, 忽略
             pass
 
+    # 注意: Nuitka 4.x 所有 INFO/WARNING/FATAL 输出都走 stderr, stdout 基本为空。
+    # 这里 stderr 也走 "line" kind, 让 _on_output 能捕获进度关键字。
+    # 日志分级交给 _classify_line_level 按内容自动上色, 不再依赖 pipe 来源。
     threading.Thread(target=_pump, args=(proc.stdout, "line"),
                      daemon=True).start()
-    threading.Thread(target=_pump, args=(proc.stderr, "error"),
+    threading.Thread(target=_pump, args=(proc.stderr, "line"),
                      daemon=True).start()
 
     try:
