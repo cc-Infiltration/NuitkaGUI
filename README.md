@@ -6,8 +6,6 @@
 [![GUI](https://img.shields.io/badge/GUI-PySide6-green.svg)]()
 [![Version](https://img.shields.io/badge/Version-1.1.0-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![CI](https://github.com/cc-Infiltration/NuitkaGUI/actions/workflows/python-app.yml/badge.svg)](https://github.com/cc-Infiltration/NuitkaGUI/actions)
-
 ## 功能
 
 - **三种打包模式**：单文件 / 单目录 / 模块

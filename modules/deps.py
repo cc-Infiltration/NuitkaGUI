@@ -37,11 +37,11 @@ _MSVC_NAME_MAP = {
 # MSVC cl.exe 版本号 → MSVC 发布年份 (cl.exe --version 输出)
 # 例如 Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35207 → MSVC 2022
 _CL_VERSION_MAP = [
-    (19, 40, "MSVC 2022+"),   # 19.40+ = VS 2022 v17.8+ / VS 2026
-    (19, 30, "MSVC 2022"),    # 19.30 - 19.39 = VS 2022
-    (19, 20, "MSVC 2019"),    # 19.20 - 19.29 = VS 2019
-    (19, 10, "MSVC 2017"),    # 19.10 - 19.19 = VS 2017
-    (19, 0, "MSVC 2015"),    # 19.00 = VS 2015
+    (19, 40, "MSVC 2022+"),  # 19.40+ = VS 2022 v17.8+ / VS 2026
+    (19, 30, "MSVC 2022"),  # 19.30 - 19.39 = VS 2022
+    (19, 20, "MSVC 2019"),  # 19.20 - 19.29 = VS 2019
+    (19, 10, "MSVC 2017"),  # 19.10 - 19.19 = VS 2017
+    (19, 0, "MSVC 2015"),  # 19.00 = VS 2015
 ]
 
 # 常见的 MinGW64 安装位置(部分含版本子目录, 需要浅层探测)
@@ -294,6 +294,7 @@ def find_msvc(extra_dirs=None):
             return tuple(int(x) for x in r["version"].split("."))
         except (ValueError, AttributeError):
             return (0, 0)
+
     results.sort(key=_sort_key, reverse=True)
 
     # 标记首选
@@ -652,6 +653,7 @@ def _find_all_gcc_windows():
             except ValueError:
                 pass
         return (0,)
+
     results.sort(key=_sort_key, reverse=True)
     return results
 
@@ -791,7 +793,7 @@ def run_mingw_download(log_queue, stop_event):
         log_queue.put(("error", "Python %s 不支持自动下载 MinGW64 编译器 (Nuitka 限制)。"
                        % sys.version.split()[0]))
         log_queue.put(("error", "请安装 Microsoft C++ Build Tools: "
-                              "winget install Microsoft.VisualStudio.2022.BuildTools"))
+                                "winget install Microsoft.VisualStudio.2022.BuildTools"))
         log_queue.put(("mingw_done", -1))
         return
     python = resolve_python()

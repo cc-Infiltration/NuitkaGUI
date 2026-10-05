@@ -274,11 +274,9 @@ TAB_SPECS = (
     ("基本选项", "_build_basic_tab"),
     ("插件", "_build_plugin_tab"),
     ("数据与模块", "_build_data_tab"),
-    ("Windows 信息", "_build_win_tab"),
+    ("元信息", "_build_win_tab"),
     ("高级", "_build_advanced_tab"),
 )
-
-
 
 # 行级别智能分级: stdout 行若含错误/警告关键词, 自动提升日志级别
 # 这些关键词必须在 stderr 缺失时能精准定位问题 (Nuitka 多数 FATAL 也会走 stderr,
